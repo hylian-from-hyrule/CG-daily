@@ -43,7 +43,13 @@
                     (insert "* " title "\n\n" body "\n\n"))))))
           (insert-buffer-substring (get-buffer " *cg-month*")))
         (let ((pdf (with-current-buffer (find-file-noselect temp)
-                     (org-latex-export-to-pdf))))
+                     (condition-case err
+                         (org-latex-export-to-pdf)
+                       (error
+                        (when (get-buffer "*Org PDF LaTeX Output*")
+                          (princ (with-current-buffer "*Org PDF LaTeX Output*"
+                                   (buffer-string))))
+                        (signal (car err) (cdr err)))))))
           (unless (and pdf (file-exists-p pdf)) (error "No PDF created"))
           (rename-file pdf dest t)
           (message "Created %s" dest)))
