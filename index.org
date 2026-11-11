@@ -1,0 +1,13 @@
+#+TITLE: Gráficos por computador — índice de artículos
+#+LANGUAGE: es
+#+STARTUP: overview
+
+* 2026
+** Noviembre
+- <2026-11-11 Wed> [[file:articulos/2026/11/2026-11-11-quake-texturas-perspectiva.org][Cómo Quake conseguía texturas con perspectiva sin una GPU]] :retro:rasterizacion:quake:
+
+* Sobre esta colección
+Un artículo técnico nuevo cada día a las 12:00 (Europe/Madrid).
+Cada artículo se guarda como fichero Org independiente, con código,
+explicaciones y enlaces a fuentes originales. El índice se amplía
+sin eliminar entradas anteriores.
