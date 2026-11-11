@@ -1,8 +1,9 @@
-name: Exportar artículos Org a PDF
+name: Exportar mes actual a PDF
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -14,68 +15,67 @@ concurrency:
 
 jobs:
   export:
-    name: Generar PDFs
+    name: Compilar PDF mensual
     runs-on: ubuntu-latest
     steps:
-      - name: Obtener repositorio
+      - name: Obtener archivos
         uses: actions/checkout@v4
 
-      - name: Instalar Pandoc, LaTeX y fuentes
+      - name: Instalar Pandoc y XeLaTeX
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pandoc texlive-xetex texlive-latex-extra \
-            texlive-fonts-recommended fonts-dejavu-core
+            texlive-lang-spanish fonts-dejavu-core
 
-      - name: Exportar artículos individuales y recopilaciones mensuales
+      - name: Compilar únicamente el mes actual
+        id: pdf
         shell: bash
+        env:
+          TZ: Europe/Madrid
         run: |
           set -euo pipefail
-          mkdir -p dist
-          mapfile -d '' articles < <(find articulos -type f -name '*.org' -print0 | sort -z)
-          if (( ${#articles[@]} == 0 )); then
-            echo "No se encontraron artículos .org"
+          year="$(date +%Y)"
+          month="$(date +%m)"
+          month_dir="articulos/$year/$month"
+          output="graficos-$year-$month.pdf"
+
+          if [[ ! -d "$month_dir" ]]; then
+            echo "::error::No existe el directorio $month_dir"
             exit 1
           fi
 
-          # Cada artículo conserva una ruta equivalente dentro del ZIP del artefacto.
-          for org in "${articles[@]}"; do
-            output="dist/${org%.org}.pdf"
-            mkdir -p "$(dirname "$output")"
-            pandoc "$org" --from=org --standalone \
-              --resource-path=".:$(dirname "$org"):assets" \
-              --pdf-engine=xelatex \
-              -V mainfont="DejaVu Serif" \
-              -V monofont="DejaVu Sans Mono" \
-              -V geometry:margin=2.2cm \
-              --highlight-style=tango \
-              --output="$output"
-          done
+          # Los nombres ISO YYYY-MM-DD ordenan los capítulos cronológicamente.
+          mapfile -d '' articles < <(
+            find "$month_dir" -maxdepth 1 -type f -name '*.org' -print0 | sort -z
+          )
+          if (( ${#articles[@]} == 0 )); then
+            echo "::error::No hay artículos Org en $month_dir"
+            exit 1
+          fi
 
-          # Un PDF que contiene, por orden cronológico, todos los artículos del mes.
-          while IFS= read -r -d '' monthdir; do
-            mapfile -d '' monthly < <(find "$monthdir" -maxdepth 1 -type f -name '*.org' -print0 | sort -z)
-            (( ${#monthly[@]} )) || continue
-            year="$(basename "$(dirname "$monthdir")")"
-            month="$(basename "$monthdir")"
-            mkdir -p "dist/mensuales/$year"
-            pandoc "${monthly[@]}" --from=org --standalone \
-              --metadata="title:Gráficos por computador — $year-$month" \
-              --resource-path=".:$monthdir:$monthdir/assets:assets" \
-              --pdf-engine=xelatex \
-              -V mainfont="DejaVu Serif" \
-              -V monofont="DejaVu Sans Mono" \
-              -V geometry:margin=2.2cm \
-              --highlight-style=tango \
-              --output="dist/mensuales/$year/$year-$month.pdf"
-          done < <(find articulos -mindepth 2 -maxdepth 2 -type d -print0 | sort -z)
+          mkdir -p dist
+          pandoc "${articles[@]}" \
+            --from=org \
+            --to=latex \
+            --standalone \
+            --file-scope \
+            --metadata="title:Gráficos por computador — $year-$month" \
+            --resource-path=".:$month_dir:$month_dir/assets" \
+            --pdf-engine=xelatex \
+            -V mainfont="DejaVu Serif" \
+            -V monofont="DejaVu Sans Mono" \
+            -V geometry:margin=2.2cm \
+            -V colorlinks=true \
+            --output="dist/$output"
 
-          find dist -type f -name '*.pdf' -print | sort
+          echo "filename=$output" >> "$GITHUB_OUTPUT"
+          echo "PDF generado: dist/$output"
 
-      - name: Publicar PDFs como artefacto descargable
+      - name: Publicar PDF mensual
         uses: actions/upload-artifact@v4
         with:
-          name: graficos-por-computador-pdf
-          path: dist/**/*.pdf
+          name: pdf-mensual
+          path: dist/${{ steps.pdf.outputs.filename }}
           if-no-files-found: error
           retention-days: 90
