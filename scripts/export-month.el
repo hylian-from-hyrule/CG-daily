@@ -6,7 +6,7 @@
        (dir (expand-file-name (format "articulos/%s/%s" year month)))
        (sources (and (file-directory-p dir)
                      (sort (directory-files dir t "^[0-9].*\\.org$") #'string<)))
-       (temp (expand-file-name ".monthly-export.org" dir))
+       (temp (expand-file-name "monthly-export.org" dir))
        (dest (expand-file-name (format "dist/graficos-%s-%s.pdf" year month)))
        (org-latex-compiler "xelatex")
        (org-latex-pdf-process
