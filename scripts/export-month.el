@@ -50,7 +50,8 @@
                           (princ (with-current-buffer "*Org PDF LaTeX Output*"
                                    (buffer-string))))
                         (signal (car err) (cdr err)))))))
-          (unless (and pdf (file-exists-p pdf)) (error "No PDF created"))
+          (setq pdf (and pdf (expand-file-name pdf dir)))
+          (unless (and pdf (file-exists-p pdf)) (error "No PDF created at %s" pdf))
           (rename-file pdf dest t)
           (message "Created %s" dest)))
     (when (file-exists-p temp) (delete-file temp))))
