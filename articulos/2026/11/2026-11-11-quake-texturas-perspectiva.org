@@ -1,0 +1,66 @@
+#+TITLE: Cómo Quake conseguía texturas con perspectiva sin una GPU
+#+DATE: <2026-11-11 Wed>
+#+LANGUAGE: es
+#+FILETAGS: :graficos:retro:rasterizacion:quake:
+#+STARTUP: overview
+
+* Introducción
+En 1996, Quake ejecutaba buena parte de su renderizador 3D en la CPU.
+Un reto fundamental era aplicar texturas a superficies en perspectiva sin
+realizar una división costosa para cada píxel.
+
+* El problema de la interpolación afín
+Interpolar directamente las coordenadas de textura ~u~ y ~v~ entre los
+extremos de un polígono produce deformaciones: la proyección en perspectiva
+no conserva distancias lineales.
+
+En su lugar, para una superficie proyectada con perspectiva, interpolamos
+en espacio de pantalla tres cantidades: ~u/z~, ~v/z~ y ~1/z~.
+Reconstruimos después las coordenadas con:
+
+  u = (u/z) / (1/z)
+  v = (v/z) / (1/z)
+
+Esto ofrece el resultado correcto, pero las divisiones por píxel eran caras.
+
+* La solución de Quake: spans de ocho píxeles
+La función ~D_DrawSpans8~ del archivo ~WinQuake/d_scan.c~ procesaba spans de
+hasta ocho píxeles. Calculaba las coordenadas corregidas al comienzo y en
+el extremo del tramo, e interpolaba linealmente dentro de él. Así reducía
+el número de divisiones. El rasterizador empleaba además coordenadas en
+punto fijo 16.16 y desplazamientos de bits.
+
+La variante de superficies turbulentas empleaba otros parámetros; en el
+código de Quake se pueden observar tramos de 16 píxeles.
+
+#+begin_src cpp
+// Pseudocódigo ilustrativo, no extraído literalmente de Quake.
+for (int x = begin; x < end; x += 8) {
+    int n = std::min(8, end - x);
+    Vec2 uv0 = perspective_uv(x);
+    Vec2 uv1 = perspective_uv(x + n);
+    Vec2 delta = (uv1 - uv0) / n;
+    Vec2 uv = uv0;
+    for (int i = 0; i < n; ++i) {
+        framebuffer[x + i] = sample(texture, uv);
+        uv += delta;
+    }
+}
+#+end_src
+
+* La idea que sigue vigente
+En un intervalo pequeño, una función no lineal suele poder aproximarse
+con una línea recta. Escoger la longitud del tramo supone intercambiar
+precisión por rendimiento. Esta decisión sigue siendo útil para crear
+rasterizadores software, motores retro y experimentos en CPUs limitadas.
+
+* Ejercicio
+Implementa dos rasterizadores: uno que recupere las coordenadas de textura
+por píxel y otro que lo haga cada ocho píxeles. Compara la distorsión y
+el tiempo de ejecución al aumentar la inclinación del polígono.
+
+* Fuentes originales y referencias
+- [[https://github.com/id-Software/Quake/blob/master/WinQuake/d_scan.c][id Software: código original del rasterizador software, d_scan.c]]
+- [[https://www.gamers.org/dEngine/quake/papers/checker_texmap.html][Chris Hecker: Perspective Texture Mapping (serie de 1995–1996)]]
+- [[https://github.com/jagregory/abrash-black-book/blob/master/src/chapter-64.md][Michael Abrash: Quake's Visible-Surface Determination]]
+- [[https://www.phatcode.net/articles.php?id=224][Michael Abrash: Graphics Programming Black Book]]
