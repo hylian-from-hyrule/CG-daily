@@ -3,64 +3,423 @@
 #+LANGUAGE: es
 #+FILETAGS: :graficos:retro:rasterizacion:quake:
 #+STARTUP: overview
+#+OPTIONS: toc:2 num:t
 
-* Introducción
-En 1996, Quake ejecutaba buena parte de su renderizador 3D en la CPU.
-Un reto fundamental era aplicar texturas a superficies en perspectiva sin
-realizar una división costosa para cada píxel.
+* De Wolfenstein y Doom a Quake: por qué 1996 fue especial
 
-* El problema de la interpolación afín
-Interpolar directamente las coordenadas de textura ~u~ y ~v~ entre los
-extremos de un polígono produce deformaciones: la proyección en perspectiva
-no conserva distancias lineales.
+En 1996 las tarjetas aceleradoras 3D empezaban a hacerse habituales, pero
+no era razonable exigir una a todos los jugadores. Quake, de id Software,
+tenía que representar un mundo tridimensional con geometría que podía
+inclinarse en varias direcciones, habitaciones superpuestas, suelos,
+techos y paredes observados desde ángulos muy diversos. Su renderizador
+software debía producir la imagen empleando principalmente la CPU.
 
-En su lugar, para una superficie proyectada con perspectiva, interpolamos
-en espacio de pantalla tres cantidades: ~u/z~, ~v/z~ y ~1/z~.
-Reconstruimos después las coordenadas con:
+Esto marca una diferencia importante con Wolfenstein 3D y Doom. El primero
+empleaba una representación más restringida del mundo; el segundo, aun
+siendo mucho más flexible, mantenía restricciones geométricas que
+permitían renderizar paredes esencialmente verticales y suelos y techos
+mediante un tratamiento especializado. Quake podía representar polígonos
+arbitrariamente orientados en un entorno tridimensional.
 
-  u = (u/z) / (1/z)
-  v = (v/z) / (1/z)
+El reto no consistía solamente en proyectar polígonos. También había que
+encontrar qué superficies eran visibles, calcular iluminación, seleccionar
+las texturas apropiadas y escribir miles de píxeles en memoria. En el
+contexto de una CPU x86 de mediados de los noventa, el número y el tipo
+de operaciones por píxel podían decidir si el juego resultaba fluido.
 
-Esto ofrece el resultado correcto, pero las divisiones por píxel eran caras.
+Nos centraremos en una de esas decisiones: calcular coordenadas de
+textura con perspectiva /por grupos de píxeles/ en lugar de resolver la
+expresión completa en todos ellos. Veremos el razonamiento matemático,
+el código histórico y las limitaciones de la aproximación.
 
-* La solución de Quake: spans de ocho píxeles
-La función ~D_DrawSpans8~ del archivo ~WinQuake/d_scan.c~ procesaba spans de
-hasta ocho píxeles. Calculaba las coordenadas corregidas al comienzo y en
-el extremo del tramo, e interpolaba linealmente dentro de él. Así reducía
-el número de divisiones. El rasterizador empleaba además coordenadas en
-punto fijo 16.16 y desplazamientos de bits.
+* Cómo llega una textura al framebuffer
 
-La variante de superficies turbulentas empleaba otros parámetros; en el
-código de Quake se pueden observar tramos de 16 píxeles.
+Una superficie poligonal tiene vértices tridimensionales. La cámara
+transforma esos vértices desde coordenadas del mundo hasta una
+representación proyectada sobre la pantalla. Cada punto de la superficie
+tiene, además, coordenadas de textura: ~s~ y ~t~ (a menudo llamadas
+~u~ y ~v~ en material moderno).
+
+En un renderizador de triángulos moderno resulta familiar este ciclo:
+
+1. Transformar y proyectar los vértices.
+2. Determinar los píxeles cubiertos por la primitiva.
+3. Interpolar atributos en cada píxel.
+4. Recuperar las coordenadas de textura e identificar el texel.
+5. Calcular el color, comprobar profundidad y escribir en el framebuffer.
+
+Quake separaba algunas de estas responsabilidades de forma distinta.
+El motor calculaba las partes visibles de las superficies; el
+rasterizador recibía estructuras de /spans/, es decir, segmentos
+horizontales de píxeles que había que pintar.
+
+Conviene diferenciar aquí dos niveles: /qué superficie es visible/ y
+/cómo se dibujan sus píxeles/. El primero está relacionado con la
+determinación de visibilidad; el segundo, con la rasterización y el
+mapeado de texturas. Nuestro protagonista, ~D_DrawSpans8~, pertenece al
+segundo nivel.
+
+* El problema: la interpolación afín no respeta la perspectiva
+
+Supongamos que una pared tiene una textura de ladrillos. El borde
+cercano ocupa muchos píxeles de pantalla, mientras que el lejano ocupa
+pocos. Esta es una consecuencia de la proyección en perspectiva.
+
+Si interpolamos linealmente entre dos coordenadas ~u0~ y ~u1~:
+
+#+begin_example
+u(x) = (1 - a) * u0 + a * u1
+a    = (x - x0) / (x1 - x0)
+#+end_example
+
+estamos suponiendo que el avance de la coordenada de textura es
+uniforme a lo largo del segmento proyectado. Pero puntos que están
+equiespaciados en el mundo /no/ tienen por qué estar equiespaciados en
+la pantalla.
+
+Al ver el polígono oblicuamente, la textura puede parecer elástica:
+se comprime o se estira donde no debe. Este defecto suele llamarse
+/affine texture warping/. Se encuentra en muchos renderizadores
+históricos que priorizaban velocidad o carecían de interpolación con
+perspectiva.
+
+** Derivación corta a partir de la proyección
+
+Para simplificar, trabajemos con una cámara de perspectiva en la que
+la coordenada horizontal proyectada cumple:
+
+#+begin_example
+x = f * X / Z
+#+end_example
+
+Aquí ~X~ es la coordenada horizontal del punto en espacio de cámara,
+~Z~ su profundidad positiva y ~f~ una escala relacionada con la
+distancia focal. La división por ~Z~ es la clave: proyectar no es una
+transformación afín.
+
+Para interpolar correctamente una coordenada de textura ~u~ sobre un
+triángulo proyectado, podemos definir:
+
+#+begin_example
+q = 1 / Z
+p = u / Z
+r = v / Z
+#+end_example
+
+Las cantidades ~p~, ~r~ y ~q~ pueden interpolarse linealmente en
+coordenadas de pantalla dentro de la primitiva. Finalmente:
+
+#+begin_example
+u = p / q
+v = r / q
+#+end_example
+
+Esta es la idea de la /interpolación con corrección de perspectiva/.
+En lugar de interpolar ~u~ directamente, interpolamos valores
+premultiplicados por la profundidad recíproca.
+
+Una propiedad útil: al movernos horizontalmente sobre un span,
+~p~, ~r~ y ~q~ pueden representarse como expresiones afines en ~x~:
+
+#+begin_example
+p(x) = p0 + dpdx * x
+r(x) = r0 + drdx * x
+q(x) = q0 + dqdx * x
+#+end_example
+
+Por tanto, podemos avanzar de un píxel al siguiente con sumas. Pero
+para recuperar ~u~ y ~v~ quedan divisiones entre cantidades variables.
+
+* El coste de hacerlo perfectamente en cada píxel
+
+Un rasterizador conceptualmente sencillo calcula ~u = p/q~ y ~v = r/q~
+en cada píxel. De esta manera, el resultado geométrico es correcto
+(salvo errores de precisión numérica y convenciones de muestreo).
+
+Sin embargo, la división era cara respecto de sumas, desplazamientos y
+accesos secuenciales a memoria, especialmente en las CPUs objetivo de
+Quake. Además, debían procesarse muchísimos píxeles por segundo.
+
+No podemos afirmar que todas las instrucciones costaran siempre lo
+mismo: las diferencias entre procesadores, la caché y el acceso a
+memoria importaban. La conclusión ingenieril es más concreta:
+hacer menos operaciones de división en el bucle interior podía ser
+una optimización valiosa.
+
+Se trata de un compromiso clásico en gráficos: una respuesta exacta
+puede obtenerse de forma repetitiva y costosa, o puede evaluarse de
+vez en cuando y aproximarse entre evaluaciones.
+
+* La técnica de Quake: tramos de ocho píxeles
+
+En el código de WinQuake, la función ~D_DrawSpans8~ transforma las
+coordenadas con perspectiva en determinados puntos de cada span,
+pero dentro de un grupo de hasta ocho píxeles avanza por interpolación
+lineal.
+
+El nombre ~D_DrawSpans8~ puede leerse como una pista sobre la longitud
+de los grupos procesados. En ~WinQuake/d_scan.c~ aparecen explícitamente
+~sdivz8stepu~, ~tdivz8stepu~ y ~zi8stepu~, calculados multiplicando
+por ocho los incrementos por píxel.
+
+El proceso, simplificado, es:
+
+1. Localizar el comienzo del span visible de una fila.
+2. Evaluar allí ~s/z~, ~t/z~ y ~1/z~.
+3. Recuperar ~s~ y ~t~ mediante la profundidad recíproca.
+4. Avanzar en las tres cantidades hasta el límite del próximo grupo.
+5. Recuperar ~s~ y ~t~ en ese punto y obtener los pasos del grupo.
+6. Pintar los píxeles interiores únicamente con sumas y accesos de
+   textura.
+7. Repetir hasta terminar el span.
+
+La implementación no sigue exactamente la misma ruta para el último
+grupo de píxeles; lo veremos más abajo.
+
+** Pseudocódigo para entender el algoritmo
+
+El ejemplo siguiente utiliza tipos de punto flotante por claridad.
+No pretende reproducir literalmente la gestión de límites ni el
+punto fijo de la implementación original.
 
 #+begin_src cpp
-// Pseudocódigo ilustrativo, no extraído literalmente de Quake.
-for (int x = begin; x < end; x += 8) {
-    int n = std::min(8, end - x);
-    Vec2 uv0 = perspective_uv(x);
-    Vec2 uv1 = perspective_uv(x + n);
-    Vec2 delta = (uv1 - uv0) / n;
-    Vec2 uv = uv0;
-    for (int i = 0; i < n; ++i) {
-        framebuffer[x + i] = sample(texture, uv);
-        uv += delta;
+struct Vec2 {
+    float u, v;
+};
+
+struct Gradients {
+    float p0, r0, q0;      // u/z, v/z, 1/z en x = 0
+    float dpdx, drdx, dqdx;
+};
+
+Vec2 corrected_uv(const Gradients& g, float x) {
+    const float p = g.p0 + x * g.dpdx;
+    const float r = g.r0 + x * g.drdx;
+    const float q = g.q0 + x * g.dqdx;
+    return { p / q, r / q };
+}
+
+// Versión didáctica: opera sobre centros de píxel y aproxima
+// entre muestras corregidas. Faltan clipping y restricciones
+// de memoria para una implementación de producción.
+void draw_span(const Gradients& g, int begin, int end) {
+    constexpr int BLOCK = 8;
+    for (int x = begin; x < end; x += BLOCK) {
+        int n = std::min(BLOCK, end - x);
+
+        Vec2 left = corrected_uv(g, float(x));
+        Vec2 right = corrected_uv(g, float(x + n));
+        Vec2 step = {
+            (right.u - left.u) / float(n),
+            (right.v - left.v) / float(n)
+        };
+
+        Vec2 uv = left;
+        for (int i = 0; i < n; ++i) {
+            put_pixel(x + i, sample_nearest(uv.u, uv.v));
+            uv.u += step.u;
+            uv.v += step.v;
+        }
     }
 }
 #+end_src
 
-* La idea que sigue vigente
-En un intervalo pequeño, una función no lineal suele poder aproximarse
-con una línea recta. Escoger la longitud del tramo supone intercambiar
-precisión por rendimiento. Esta decisión sigue siendo útil para crear
-rasterizadores software, motores retro y experimentos en CPUs limitadas.
+Obsérvese que este ejemplo necesita dos divisiones por coordenada
+en las evaluaciones de los extremos, pero no dentro del bucle interior
+de ocho píxeles. En una implementación real pueden reutilizarse
+resultados entre bloques. La versión de Quake combina además
+optimizaciones específicas para evitar costes de división al calcular
+los incrementos de un bloque completo.
 
-* Ejercicio
-Implementa dos rasterizadores: uno que recupere las coordenadas de textura
-por píxel y otro que lo haga cada ocho píxeles. Compara la distorsión y
-el tiempo de ejecución al aumentar la inclinación del polígono.
+* El código original: tres detalles especialmente interesantes
 
-* Fuentes originales y referencias
-- [[https://github.com/id-Software/Quake/blob/master/WinQuake/d_scan.c][id Software: código original del rasterizador software, d_scan.c]]
-- [[https://www.gamers.org/dEngine/quake/papers/checker_texmap.html][Chris Hecker: Perspective Texture Mapping (serie de 1995–1996)]]
-- [[https://github.com/jagregory/abrash-black-book/blob/master/src/chapter-64.md][Michael Abrash: Quake's Visible-Surface Determination]]
-- [[https://www.phatcode.net/articles.php?id=224][Michael Abrash: Graphics Programming Black Book]]
+** 1. Coordenadas de textura en punto fijo 16.16
+
+Quake almacena las coordenadas ~s~ y ~t~ de este bucle como
+~fixed16_t~. La interpretación 16.16 reserva normalmente 16 bits
+para la parte fraccionaria y el resto para la parte entera.
+
+Por ejemplo, ~3.5~ se representa numéricamente como:
+
+#+begin_example
+3.5 * 65536 = 229376
+#+end_example
+
+Extraer el texel de una coordenada de textura de punto fijo se
+reduce a un desplazamiento:
+
+#+begin_src c
+texel_x = s >> 16;
+texel_y = t >> 16;
+color = texture[texel_y * cachewidth + texel_x];
+#+end_src
+
+El código original utiliza esta idea en su bucle más interno:
+desplazamientos, una multiplicación por el ancho de textura, un acceso
+a memoria y sumas para avanzar ~s~ y ~t~.
+
+No necesitamos multiplicar y dividir números en coma flotante para
+cada coordenada de texel.
+
+** 2. Dividir entre ocho mediante un desplazamiento
+
+Para grupos completos de ocho píxeles, Quake obtiene los pasos en
+punto fijo con operaciones equivalentes a:
+
+#+begin_src c
+sstep = (snext - s) >> 3;
+tstep = (tnext - t) >> 3;
+#+end_src
+
+El desplazamiento de tres bits equivale a una división por ocho
+con las particularidades de redondeo de la aritmética entera.
+
+El código original es más cuidadoso de lo que sugiere una simple
+interpolación: limita las coordenadas ~snext~ y ~tnext~ para que
+errores de redondeo no hagan que el acceso salga de la superficie
+de textura disponible.
+
+Esto recuerda que un rasterizador no es solo matemática: también
+es ingeniería de memoria. Un pequeño error en una coordenada puede
+convertirse en un acceso a memoria fuera de rango.
+
+** 3. El último grupo no se trata igual
+
+Al final de un span puede quedar un bloque más pequeño. El código
+original tiene una rama para el tramo final: calcula las coordenadas
+corregidas correspondientes a su /último píxel/, no simplemente al
+extremo posterior al span; así evita avanzar fuera del polígono.
+
+Cuando hay más de un píxel restante, divide la diferencia por
+~spancount - 1~, en vez de usar el desplazamiento pensado para ocho.
+
+Este detalle es importante al leer código de gráficos antiguos:
+las rutas de bordes y extremos rara vez son un añadido secundario.
+A menudo concentran buena parte de los problemas de precisión,
+clipping y acceso a memoria.
+
+* Por qué un tramo corto funciona
+
+La expresión relevante sobre un span tiene la forma:
+
+#+begin_example
+u(x) = (a*x + b) / (c*x + d)
+#+end_example
+
+En general es una función racional, no una línea recta. Sin embargo,
+en un intervalo corto podemos aproximarla con una interpolación lineal
+entre dos muestras de referencia.
+
+Si el intervalo se acorta, normalmente disminuye el error; si se
+alarga, ahorramos todavía más cálculos de corrección de perspectiva,
+pero podemos notar deformaciones. El comportamiento depende del
+gradiente de profundidad y de la orientación de la superficie.
+
+Hay dos límites intuitivos:
+
+- Cuando la profundidad apenas varía a lo largo del span, la
+  aproximación afín puede ser muy buena.
+- Cuando el polígono se aleja rápidamente de la cámara, las
+  coordenadas corregidas pueden cambiar de manera más no lineal y
+  el error entre extremos aumenta.
+
+¿Por qué no usar spans de dos píxeles? Porque requeriríamos más
+evaluaciones caras. ¿Por qué no usar spans de 32? Porque podría
+notarse el error. Ocho era una elección de ingeniería para las
+restricciones del motor, no una constante universal.
+
+* ¿Dónde encaja esto en el resto del renderizador?
+
+Quake no dibujaba necesariamente todos los polígonos de la escena
+sin más. El motor utilizaba una combinación de partición espacial,
+determinación de visibilidad, orden de superficies y otras técnicas
+para reducir el trabajo de rasterización.
+
+Michael Abrash documentó con detalle la determinación de superficies
+visibles de Quake. Ese problema es diferente del mapeado de textura,
+pero ambos se complementan: primero evitamos dibujar píxeles
+innecesarios; después hacemos más barato el trabajo sobre los
+píxeles que sí hay que dibujar.
+
+También había tratamiento específico de superficies con efectos,
+como el agua: ~Turbulent8~ empleaba grupos de 16 y perturbaciones
+en las coordenadas de textura. No conviene mezclarlo con la ruta
+normal de ~D_DrawSpans8~: ambas comparten principios, pero resuelven
+efectos distintos.
+
+* Qué hace una GPU moderna en su lugar
+
+En una GPU actual, el rasterizador y las unidades asociadas
+interpolan atributos de manera especializada. Los fragment shaders
+reciben normalmente coordenadas de textura ya interpoladas con
+perspectiva, salvo que se solicite explícitamente otro comportamiento
+mediante los calificadores apropiados.
+
+La GPU también ofrece filtrado de texturas, acceso a mipmaps,
+manejo de profundidad y procesamiento masivamente paralelo. Esto
+no elimina el problema matemático: lo traslada a hardware diseñado
+para resolverlo de forma eficiente.
+
+Las mismas expresiones ~u/z~, ~v/z~ y ~1/z~ siguen siendo útiles
+para comprender cómo funciona una pipeline gráfica. También explican
+por qué la interpolación ~noperspective~ de APIs modernas puede
+producir un resultado visualmente distinto.
+
+* Experimento práctico en C++: medir calidad y rendimiento
+
+Un ejercicio interesante consiste en escribir un rasterizador
+mínimo con una textura cuadriculada y una pared que se aleje de la
+cámara. Implementa tres variantes:
+
+1. Interpolación afín de ~u~ y ~v~ a lo largo de toda la fila.
+2. Corrección de perspectiva en cada píxel.
+3. Corrección de perspectiva cada N píxeles, con ~N = 4, 8, 16, 32~.
+
+Utiliza la variante 2 como referencia y calcula un error de textura.
+Por ejemplo, para cada píxel cubierto, compara sus coordenadas UV:
+
+#+begin_example
+E = (1/M) * sum_i length(uv_aprox_i - uv_ref_i)
+#+end_example
+
+Para el rendimiento, mide el tiempo sobre muchas repeticiones,
+sin incluir la generación de geometría ni la carga de texturas.
+Evita que el compilador elimine la escritura del framebuffer y
+emplea la misma política de muestreo en todas las variantes.
+
+Prueba a modificar la inclinación de la pared. La hipótesis es
+que el error de la aproximación por tramos aumentará al aumentar
+la variación de profundidad, aunque los resultados concretos
+dependen de la escena y de las decisiones de implementación.
+
+Una CPU moderna puede cambiar completamente las conclusiones de
+rendimiento: divisiones, vectorización, predicción de saltos y
+cachés se comportan de manera distinta. El propósito del ejercicio
+no es demostrar que el algoritmo histórico siga siendo el más
+rápido, sino entender /por qué tenía sentido en 1996/.
+
+* Conclusión
+
+Una de las ideas más elegantes del Quake software es que no hace
+falta resolver de manera exacta y costosa una función en todos los
+píxeles si es posible aproximarla en intervalos controlados.
+
+El diseño combina matemáticas de proyección, interpolación,
+representación en punto fijo, alineación del trabajo con la
+estructura de memoria y manejo cuidadoso de los límites.
+
+La lección trasciende los videojuegos retro: muchas optimizaciones
+gráficas consisten en identificar qué cálculos pueden hacerse con
+menor frecuencia sin introducir un error visual inaceptable.
+
+* Fuentes originales y lecturas recomendadas
+
+- [[https://github.com/id-Software/Quake/blob/master/WinQuake/d_scan.c][id Software, Quake: WinQuake/d_scan.c]] — implementación de ~D_DrawSpans8~, ~Turbulent8~ y gestión de spans.
+- [[https://github.com/id-Software/Quake][id Software: repositorio del código fuente de Quake]] — contexto del motor completo.
+- [[https://www.gamers.org/dEngine/quake/papers/checker_texmap.html][Chris Hecker: Perspective Texture Mapping]] — serie histórica sobre mapeado correcto de texturas.
+- [[https://github.com/jagregory/abrash-black-book/blob/master/src/chapter-64.md][Michael Abrash: Quake's Visible-Surface Determination]] — la otra mitad del problema: visibilidad.
+- [[https://www.phatcode.net/articles.php?id=224][Michael Abrash: Graphics Programming Black Book]] — programación gráfica y optimización de la época.
+
+Nota: el pseudocódigo, la derivación resumida y las propuestas de
+experimentos son explicaciones didácticas; no deben confundirse
+con transcripciones literales del código de id Software.
