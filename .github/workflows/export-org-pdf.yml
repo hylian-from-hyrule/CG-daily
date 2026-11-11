@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pandoc texlive-xetex texlive-latex-extra \
-            texlive-lang-spanish fonts-dejavu-core
+            texlive-lang-spanish lmodern fonts-dejavu-core
 
       - name: Compilar únicamente el mes actual
         id: pdf
