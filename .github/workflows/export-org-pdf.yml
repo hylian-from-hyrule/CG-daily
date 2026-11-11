@@ -1,9 +1,8 @@
-name: Exportar mes actual a PDF
+name: Exportar Org con Emacs a PDF
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -15,67 +14,34 @@ concurrency:
 
 jobs:
   export:
-    name: Compilar PDF mensual
+    name: PDF mensual con Org mode
     runs-on: ubuntu-latest
     steps:
-      - name: Obtener archivos
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Instalar Pandoc y XeLaTeX
+      - name: Instalar Emacs y XeLaTeX
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pandoc texlive-xetex texlive-latex-extra \
+            emacs-nox \
+            texlive-xetex texlive-latex-extra \
+            texlive-latex-recommended texlive-fonts-recommended \
             texlive-lang-spanish lmodern fonts-dejavu-core
 
-      - name: Compilar únicamente el mes actual
-        id: pdf
-        shell: bash
+      - name: Exportar con Org en modo batch
         env:
           TZ: Europe/Madrid
         run: |
           set -euo pipefail
-          year="$(date +%Y)"
-          month="$(date +%m)"
-          month_dir="articulos/$year/$month"
-          output="graficos-$year-$month.pdf"
+          emacs --batch -Q -l scripts/export-month.el
+          find dist -maxdepth 1 -type f -name '*.pdf' -print
+          test "$(find dist -maxdepth 1 -type f -name '*.pdf' | wc -l)" -eq 1
 
-          if [[ ! -d "$month_dir" ]]; then
-            echo "::error::No existe el directorio $month_dir"
-            exit 1
-          fi
-
-          # Los nombres ISO YYYY-MM-DD ordenan los capítulos cronológicamente.
-          mapfile -d '' articles < <(
-            find "$month_dir" -maxdepth 1 -type f -name '*.org' -print0 | sort -z
-          )
-          if (( ${#articles[@]} == 0 )); then
-            echo "::error::No hay artículos Org en $month_dir"
-            exit 1
-          fi
-
-          mkdir -p dist
-          pandoc "${articles[@]}" \
-            --from=org \
-            --to=latex \
-            --standalone \
-            --file-scope \
-            --metadata="title:Gráficos por computador — $year-$month" \
-            --resource-path=".:$month_dir:$month_dir/assets" \
-            --pdf-engine=xelatex \
-            -V mainfont="DejaVu Serif" \
-            -V monofont="DejaVu Sans Mono" \
-            -V geometry:margin=2.2cm \
-            -V colorlinks=true \
-            --output="dist/$output"
-
-          echo "filename=$output" >> "$GITHUB_OUTPUT"
-          echo "PDF generado: dist/$output"
-
-      - name: Publicar PDF mensual
+      - name: Subir único PDF mensual
         uses: actions/upload-artifact@v4
         with:
           name: pdf-mensual
-          path: dist/${{ steps.pdf.outputs.filename }}
+          path: dist/*.pdf
           if-no-files-found: error
           retention-days: 90
