@@ -1,0 +1,369 @@
+#+TITLE: Del Z-buffer de los noventa al reversed-Z: cómo decide un motor qué superficie vemos
+#+DATE: <2026-11-12 Thu>
+#+LANGUAGE: es
+#+OPTIONS: toc:3 num:t
+#+FILETAGS: :historia:retro:gpu:rasterizacion:profundidad:opengl:
+#+DESCRIPTION: Historia, matemáticas e implementación de la eliminación de superficies ocultas y de la precisión de profundidad.
+
+* Introducción: el problema que una imagen de 1996 tenía que resolver
+
+Imaginemos una habitación de un videojuego de 1996. La cámara mira hacia una puerta; detrás hay un pasillo, delante una columna y, cruzando el encuadre, un enemigo compuesto por triángulos. Proyectar los vértices sobre la pantalla es relativamente sencillo. Lo difícil es decidir, para cada píxel, *qué superficie está delante*. Si dibujamos la pared después del enemigo, podemos taparlo aunque esté más cerca. Si invertimos el orden, la pared podría atravesar una columna. Y si dos polígonos se intersecan, ningún orden global de objetos es necesariamente correcto.
+
+Este artículo continúa la exploración del renderizado de Quake desde un ángulo diferente: no estudia la corrección de texturas, sino la *visibilidad*, el coste de escribir píxeles ocultos y el comportamiento numérico del buffer de profundidad. Seguiremos el hilo desde los ordenamientos de los motores software hasta el Z-buffer de las tarjetas aceleradoras y una técnica moderna, /reversed-Z/, que invierte la convención de profundidad para ganar precisión con formatos flotantes.
+
+La idea central es sencilla: cada muestra de pantalla conserva una profundidad y solo acepta una nueva muestra si supera una comparación. Pero la implementación real combina geometría proyectiva, cuantización, ancho de banda, orden de rasterización y reglas de las APIs. Es precisamente esa combinación la que explica tanto las soluciones ingeniosas de los noventa como algunos artefactos que todavía aparecen en motores modernos.
+
+* Antes del Z-buffer: ¿por qué no ordenar los polígonos?
+
+** El algoritmo del pintor
+
+Una solución intuitiva consiste en ordenar las superficies desde las más lejanas hasta las más próximas y dibujarlas en ese orden. Cada superficie nueva tapa las anteriores, como capas de pintura. Para escenas sencillas y objetos separados, funciona y evita almacenar una profundidad por píxel.
+
+Pero ¿qué significa «más lejano» para un polígono inclinado? Dos triángulos pueden solaparse en pantalla y alternar cuál está delante según el punto. Incluso pueden atravesarse. Un único valor de distancia por triángulo no expresa esa relación. La solución general requiere partir geometría o decidir visibilidad a una granularidad más fina.
+
+El algoritmo del pintor tampoco elimina trabajo oculto: puede escribir varias veces el mismo píxel. En una máquina donde el framebuffer y la memoria de vídeo eran caros de acceder, el /overdraw/ tenía un coste tangible. La ausencia de Z-buffer ahorraba memoria, pero no necesariamente tiempo.
+
+** BSP y spans: una decisión distinta en Quake
+
+Un árbol BSP divide el espacio con planos. Si la geometría está organizada apropiadamente, recorrer sus nodos en función de la posición de la cámara permite obtener un orden espacial útil. En los motores software de los noventa esto podía combinarse con /spans/: intervalos horizontales de píxeles pertenecientes a una superficie.
+
+Michael Abrash documentó cómo el renderizador software del mundo de Quake utilizaba spans ordenados para evitar dibujar repetidamente píxeles del escenario. El objetivo era aproximarse a *cero overdraw para el mundo estático*, no simplemente ordenar objetos completos. El motor generaba spans visibles y los texturizaba después. El orden BSP era especialmente atractivo porque el trabajo de determinar visibilidad podía aprovechar la estructura espacial precomputada.
+
+Hay una sutileza histórica importante: Quake no fue simplemente «un juego sin Z-buffer». Abrash explica que, una vez dibujados los spans del mundo, se rellenaba la profundidad correspondiente y se dibujaban los modelos poligonales con comparaciones Z. Es decir, combinaba dos métodos: visibilidad analítica para la arquitectura del nivel y profundidad por píxel para entidades móviles y partículas. Abrash estimó para ese diseño un coste adicional aproximado del 10 % al rellenar el buffer del mundo; es una cifra de su contexto y no una regla universal.
+
+La lección arquitectónica es que una representación que funciona para paredes estáticas no tiene por qué ser buena para un personaje animado. La geometría estática admite preprocesado; los objetos dinámicos requieren una solución más flexible.
+
+* Qué almacena realmente un Z-buffer
+
+** Un valor por muestra, no por objeto
+
+Supongamos un framebuffer de 640 × 480. Si almacenamos un entero de 16 bits por píxel para la profundidad, necesitamos:
+
+#+begin_example
+640 × 480 × 2 = 614400 bytes = 600 KiB
+#+end_example
+
+Con 24 bits de profundidad empaquetados en 32 bits, el almacenamiento físico habitual para esa imagen puede ser 1 228 800 bytes, aproximadamente 1,17 MiB. El tamaño real depende del formato, alineación, muestras MSAA y organización interna de la GPU. En un PC de mediados de los noventa, reservar y mover esta memoria no era trivial. En una GPU moderna, además de capacidad, importan el tráfico y la compresión.
+
+El procedimiento conceptual para un fragmento opaco es:
+
+1. Rasterizar un triángulo y obtener las muestras que cubre.
+2. Interpolar la profundidad de cada muestra.
+3. Compararla con la almacenada.
+4. Si el fragmento es más cercano, escribir color y nueva profundidad.
+5. En caso contrario, descartar su contribución.
+
+El Z-buffer resuelve la visibilidad de superficies opacas independientemente del orden de dibujo *siempre que* la prueba y las escrituras estén configuradas coherentemente y no intervengan efectos especiales. No resuelve por sí solo transparencias, intersecciones geométricas incorrectas ni el problema de dos superficies prácticamente coplanares.
+
+** Un rasterizador mínimo en C++
+
+Para comprender el mecanismo, implementemos un caso didáctico. Partimos de un triángulo ya proyectado en coordenadas de pantalla y con profundidad normalizada ~z~ en el intervalo [0,1], donde 0 es cercano. Usaremos coordenadas baricéntricas; no cubriremos aquí recorte contra el frustum ni reglas exactas de cobertura compartida entre triángulos.
+
+#+begin_src cpp
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <vector>
+
+struct Vertex {
+    float x, y;
+    float depth;  // Profundidad de ventana, ya proyectada.
+};
+
+struct Image {
+    int width, height;
+    std::vector<float> depth;
+    std::vector<std::uint32_t> color;
+
+    Image(int w, int h)
+        : width(w), height(h),
+          depth(w * h, 1.0f), color(w * h, 0) {}
+};
+
+float edge(const Vertex& a, const Vertex& b, float x, float y) {
+    return (x - a.x) * (b.y - a.y)
+         - (y - a.y) * (b.x - a.x);
+}
+
+void draw_triangle(Image& img, Vertex a, Vertex b, Vertex c,
+                   std::uint32_t rgba) {
+    float area = edge(a, b, c.x, c.y);
+    if (std::abs(area) < 1e-8f) return;
+
+    int min_x = std::max(0, (int)std::floor(
+        std::min({a.x, b.x, c.x})));
+    int max_x = std::min(img.width - 1, (int)std::ceil(
+        std::max({a.x, b.x, c.x})));
+    int min_y = std::max(0, (int)std::floor(
+        std::min({a.y, b.y, c.y})));
+    int max_y = std::min(img.height - 1, (int)std::ceil(
+        std::max({a.y, b.y, c.y})));
+
+    for (int y = min_y; y <= max_y; ++y) {
+        for (int x = min_x; x <= max_x; ++x) {
+            float px = x + 0.5f, py = y + 0.5f;
+            float u = edge(b, c, px, py) / area;
+            float v = edge(c, a, px, py) / area;
+            float w = 1.0f - u - v;
+            if (u < 0 || v < 0 || w < 0) continue;
+
+            // La profundidad de ventana se interpola en pantalla.
+            float z = u * a.depth + v * b.depth + w * c.depth;
+            int i = y * img.width + x;
+            if (z < img.depth[i]) {
+                img.depth[i] = z;
+                img.color[i] = rgba;
+            }
+        }
+    }
+}
+#+end_src
+
+Este código es deliberadamente incompleto como rasterizador de producción. Para no dejar grietas entre triángulos adyacentes, una implementación real aplica una convención de bordes, como /top-left/. También necesita clipping antes de dividir por W, tratamiento de NaN, pruebas de stencil y, si hay texturas, interpolación perspectiva de atributos. La interpolación lineal aquí es correcta para la profundidad *después* de la división perspectiva y transformación a coordenadas de ventana; no lo sería para coordenadas UV sin la corrección apropiada.
+
+Un experimento útil: dibuja dos triángulos solapados, intercambia su orden y comprueba que el resultado es el mismo, salvo empates y precisión numérica. Después desactiva la comparación: reaparece el problema del pintor.
+
+* De la cámara al buffer: por qué la profundidad no es lineal
+
+** Espacio de cámara y proyección
+
+Usaremos una cámara que mira hacia delante, y llamaremos ~d > 0~ a la distancia positiva a lo largo del eje de visión. El plano cercano está en ~n~, el lejano en ~f~, con ~0 < n < f~.
+
+En una proyección perspectiva, los objetos más lejanos se hacen pequeños porque sus coordenadas de pantalla dependen de ~x/d~ e ~y/d~. La profundidad que producen las matrices habituales tiene también una dependencia con ~1/d~. En una convención de profundidad de ventana [0,1], con 0 cerca y 1 lejos, podemos escribir:
+
+\[
+z(d) = \frac{f}{f-n} - \frac{fn}{(f-n)d}.
+\]
+
+Comprobación en los extremos:
+
+\[
+z(n)=0,\qquad z(f)=1.
+\]
+
+Es una función de la forma ~A + B/d~, no una interpolación lineal de la distancia. La pendiente es:
+
+\[
+\frac{dz}{dd}=\frac{fn}{(f-n)d^2}.
+\]
+
+Esto explica el comportamiento clave: para un incremento de distancia fijo, la diferencia de profundidad codificada disminuye aproximadamente con ~1/d²~. Los objetos muy lejanos terminan amontonados cerca del valor 1.
+
+** Un ejemplo numérico: 16 bits y un plano cercano mal elegido
+
+Supongamos ~n = 0,01 m~, ~f = 1000 m~ y un Z-buffer entero de 16 bits. Solo hay 65 536 códigos distintos. El valor normalizado almacenado es aproximadamente ~round(65535 * z) / 65535~.
+
+Podemos invertir la fórmula para reconstruir la distancia:
+
+\[
+d(z)=\frac{fn}{f-z(f-n)}.
+\]
+
+El penúltimo código, ~z = 65534/65535~, corresponde aproximadamente a 395,9 m; el último corresponde a 1000 m. Por tanto, una enorme parte de la región distante se representa con poquísimos códigos. Dos superficies separadas por metros pueden terminar con la misma profundidad cuantizada. Esta cifra coincide con el ejemplo desarrollado por la documentación técnica de Khronos sobre precisión del depth buffer.
+
+Ahora cambiemos solamente ~n~ de 0,01 m a 0,1 m. El rango visible pierde diez centímetros próximos a la cámara, pero el reparto de precisión mejora de manera muy notable. Alejar el plano cercano suele ser más eficaz que acercar moderadamente el lejano. La razón se ve directamente en la expresión: el cociente ~f/n~ gobierna gran parte del problema.
+
+** Z-fighting: una consecuencia observable
+
+Cuando dos superficies reciben valores de profundidad indistinguibles, el resultado puede depender de pequeñas diferencias de rasterización, orden de envío y comparaciones ~LESS~ o ~LEQUAL~. Aparecen patrones parpadeantes: el conocido /Z-fighting/.
+
+Es habitual en calcomanías pegadas a paredes, carreteras dibujadas sobre terreno y modelos con caras duplicadas. No basta con «usar 32 bits» sin pensar en la proyección: el formato y el reparto de precisión interactúan. Tampoco conviene aplicar indiscriminadamente un desplazamiento de profundidad; un /depth bias/ grande puede hacer que un objeto atraviese otros.
+
+* Cómo se configuraba en las APIs de finales de los noventa y 2000
+
+** OpenGL clásico
+
+En OpenGL tradicional, el programa necesita un framebuffer con almacenamiento de profundidad. Activar el test no crea mágicamente ese almacenamiento. La secuencia típica es:
+
+#+begin_src cpp
+// Requiere un contexto y un framebuffer con depth attachment.
+glEnable(GL_DEPTH_TEST);
+glDepthFunc(GL_LESS);
+glDepthMask(GL_TRUE);
+glClearDepth(1.0);
+glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+// Dibujar geometría opaca...
+#+end_src
+
+~GL_LESS~ acepta fragmentos cuya profundidad sea menor que la almacenada. Limpiar a 1 significa comenzar cada fotograma con la profundidad máxima. ~glDepthMask(GL_FALSE)~ impide escribir profundidad, algo útil en ciertos pases transparentes, pero no desactiva la prueba.
+
+En OpenGL histórico, las coordenadas normalizadas después de la división perspectiva usan Z en [-1,1], que se transforma después al intervalo de ventana [0,1]. Conviene separar estos espacios: confundir la Z del ojo, la Z de clipping y la Z almacenada conduce a errores difíciles de depurar.
+
+** Direct3D 9: estados explícitos y W-buffer
+
+Direct3D 9 expresa la misma idea mediante estados de renderizado:
+
+#+begin_src cpp
+// device es un IDirect3DDevice9* válido.
+device->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+device->Clear(0, nullptr, D3DCLEAR_ZBUFFER,
+              0, 1.0f, 0);
+#+end_src
+
+El ejemplo presupone que se ha creado y asociado una superficie de profundidad compatible. La documentación de Microsoft también recoge ~D3DZB_USEW~: el /W-buffering/, que emplea una representación de profundidad basada en W y exige una matriz de proyección compatible. No fue una solución universal ni debe suponerse disponible en cualquier hardware. Sirve para recordar que la elección de cómo codificar la profundidad era una cuestión visible para las APIs y controladores de la época.
+
+En ambos casos, hay que pensar en *dos* estados independientes: probar la profundidad y escribirla. Una superficie translúcida puede necesitar probar contra el mundo opaco sin sobrescribir su profundidad.
+
+* El coste real: ancho de banda, overdraw y early-Z
+
+** ¿Cuántas veces se toca un píxel?
+
+Imaginemos una pantalla de 1920 × 1080 con cuatro capas opacas superpuestas. Si se rasterizan de atrás hacia delante, cada capa podría generar fragmentos que llegan al test; algunas operaciones de sombreado pueden repetirse inútilmente. Dibujar de delante hacia atrás permite que la primera superficie deje profundidad y que las siguientes sean rechazadas antes de ejecutar trabajo caro, siempre que la arquitectura y el shader permitan pruebas tempranas.
+
+Las GPU modernas pueden realizar /early depth testing/ y mantener estructuras jerárquicas de profundidad que rechazan regiones enteras. No debemos confundir esto con una garantía absoluta de «cero coste» para fragmentos ocultos. La geometría debe procesarse, el hardware debe determinar cobertura y ciertos shaders impiden o limitan la optimización.
+
+Por ejemplo, escribir ~gl_FragDepth~ puede obligar a posponer la prueba, porque la profundidad definitiva ya no es necesariamente la interpolada. Operaciones como ~discard~ y determinadas interacciones con efectos laterales también condicionan el orden permitido. Las reglas exactas dependen de API, versión y hardware.
+
+** Un depth pre-pass: ¿merece la pena?
+
+Un motor puede dibujar primero la geometría opaca con un shader muy barato que solo rellene profundidad y, después, dibujar los materiales costosos probando igualdad o una comparación adecuada. Así evita ejecutar shaders complejos para muchas superficies ocultas. El coste es procesar geometría otra vez y generar tráfico adicional de profundidad.
+
+En una escena dominada por shaders caros y mucho overdraw, puede ganar. En una escena limitada por geometría, CPU o ancho de banda, puede perder. También existen técnicas de oclusión jerárquica, ordenamiento aproximado de mallas y sistemas de visibilidad por celdas. No hay una política universal: hay que medir tiempos de GPU y contar invocaciones de fragment shader.
+
+El paralelismo histórico es interesante: el motor software de Quake trabajaba para evitar el overdraw *antes* de texturizar el mundo; las GPU modernas pueden rechazar fragmentos tempranamente con ayuda del Z-buffer. El objetivo económico es similar, aunque las estructuras y costes sean diferentes.
+
+* Reversed-Z: invertir la profundidad para aprovechar float
+
+** El problema del Z tradicional
+
+Un buffer flotante IEEE 754 de 32 bits no reparte sus números uniformemente: hay muchos valores representables cerca de cero y una separación mayor entre números cerca de uno. La proyección tradicional hace lo contrario de lo que querríamos para el mundo distante: concentra la profundidad de las superficies lejanas cerca de 1, donde la granularidad absoluta de float es relativamente gruesa.
+
+La idea de /reversed-Z/ es invertir la asignación:
+
+- Plano cercano: profundidad 1.
+- Plano lejano: profundidad 0.
+- Prueba: gana el valor *mayor*.
+- Limpieza: 0.
+
+La profundidad invertida se expresa como:
+
+\[
+z_r(d)=1-z(d)
+      =\frac{fn}{(f-n)d}-\frac{n}{f-n}.
+\]
+
+Si llevamos ~f~ al infinito, queda una expresión especialmente simple:
+
+\[
+z_r(d)=\frac{n}{d}.
+\]
+
+Con ~d=n~, el valor es 1; a medida que el objeto se aleja, tiende a cero. La distribución de precisión flotante cerca de cero compensa gran parte de la concentración introducida por ~1/d~. No significa precisión infinita ni arregla geometría coplanar, pero mejora muchísimo el comportamiento en escenas con gran rango de distancias.
+
+Es crucial distinguir formatos: *invertir Z con un buffer entero de precisión fija no aporta automáticamente la misma mejora*. La gran ventaja proviene de combinar la proyección invertida con profundidad flotante.
+
+** Configuración OpenGL moderna
+
+Con ~glClipControl~, disponible en OpenGL 4.5 o mediante la extensión apropiada, podemos usar profundidad NDC [0,1], más cómoda para reversed-Z. Ejemplo esquemático:
+
+#+begin_src cpp
+// Requiere soporte de glClipControl y un depth buffer flotante.
+glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+glEnable(GL_DEPTH_TEST);
+glDepthFunc(GL_GREATER);
+glClearDepth(0.0);
+glDepthMask(GL_TRUE);
+glClear(GL_DEPTH_BUFFER_BIT);
+#+end_src
+
+Además de estos estados, hay que cambiar *la matriz de proyección*. No basta con sustituir ~GL_LESS~ por ~GL_GREATER~. Con cámara mirando hacia -Z, proyección perspectiva simétrica, ~f~ infinito y convención NDC [0,1], la matriz puede construirse para producir:
+
+#+begin_example
+clip.z = n
+clip.w = d = -eye.z
+ndc.z  = clip.z / clip.w = n / d
+#+end_example
+
+En una matriz de columnas, las entradas relevantes del bloque de profundidad son ~P[2][2]=0~, ~P[3][2]=n~, ~P[2][3]=-1~ y ~P[3][3]=0~, si ~P[col][row]~ es la convención usada. Los términos X/Y dependen del FOV y la relación de aspecto. Hay que revisar cuidadosamente si la biblioteca usa matrices por filas, columnas y vectores pre/postmultiplicados.
+
+En Vulkan y Direct3D, el rango de profundidad normalizado [0,1] encaja de forma natural, pero siguen siendo necesarias una matriz invertida, una comparación ~GREATER~ o ~GREATER_OR_EQUAL~ y una limpieza a cero. En Vulkan también hay que coordinar el viewport, el formato de imagen y el estado del pipeline.
+
+** ¿Qué ocurre con las sombras y los efectos posteriores?
+
+Una migración a reversed-Z afecta a más componentes que la cámara principal. Los pases de sombras pueden usar otra convención; el shader que reconstruye posición desde profundidad debe invertir la nueva proyección; el cielo, las calcomanías y los efectos que comparan profundidad necesitan revisión.
+
+Por ejemplo, un shader que antes interpretaba ~depth == 1~ como «no hay geometría» puede necesitar interpretar ~depth == 0~. Es mejor encapsular las conversiones entre profundidad, distancia lineal y posición en funciones compartidas, no distribuir suposiciones por decenas de shaders.
+
+* Transparencia: el límite fundamental del método
+
+El Z-buffer representa la superficie ganadora por muestra, no una lista de todas las capas visibles. Para un vidrio semitransparente, el color final depende también de lo que hay detrás. Una aproximación clásica consiste en dibujar primero los objetos opacos con profundidad normal y luego los transparentes de atrás hacia delante, manteniendo el test activo pero deshabilitando escrituras de profundidad.
+
+#+begin_src cpp
+// Tras renderizar los opacos, ejemplo de estado OpenGL:
+glEnable(GL_BLEND);
+glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+glDepthMask(GL_FALSE);
+// Dibujar transparencias ordenadas de atrás hacia delante.
+glDepthMask(GL_TRUE);
+glDisable(GL_BLEND);
+#+end_src
+
+Este método falla cuando los objetos transparentes se intersecan o cuando el orden cambia dentro de un mismo triángulo. Técnicas de /order-independent transparency/ guardan múltiples fragmentos o utilizan acumulaciones aproximadas, pero añaden memoria, complejidad y restricciones. El Z-buffer sigue siendo una herramienta fundamental, no una solución completa a toda la composición de imágenes.
+
+* Un experimento reproducible para entender la precisión
+
+Podemos estudiar el reparto de distancias con un programa pequeño sin GPU. Este ejemplo imprime la distancia que corresponde al penúltimo código de un Z-buffer entero de 16 bits. Cambia ~near_plane~ y observa el resultado.
+
+#+begin_src cpp
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+
+double depth(double d, double n, double f) {
+    return f / (f - n) - (f * n) / ((f - n) * d);
+}
+double distance_from_depth(double z, double n, double f) {
+    return (f * n) / (f - z * (f - n));
+}
+int main() {
+    constexpr double far_plane = 1000.0;
+    constexpr double max_code = 65535.0;
+    for (double near_plane : {0.01, 0.1, 1.0}) {
+        double z = (max_code - 1.0) / max_code;
+        std::cout << "near=" << near_plane
+                  << " penultimo_codigo_d="
+                  << distance_from_depth(z, near_plane, far_plane)
+                  << " z(100m)="
+                  << depth(100.0, near_plane, far_plane)
+                  << '\n';
+    }
+}
+#+end_src
+
+Compilación orientativa:
+
+#+begin_src sh
+c++ -std=c++20 -O2 depth.cpp -o depth
+./depth
+#+end_src
+
+Para profundizar, repite el experimento con ~float~ y ~std::nextafter~: compara la distancia reconstruida a partir de dos profundidades flotantes consecutivas, tanto con Z tradicional como con reversed-Z. Usa ~double~ para la reconstrucción y evita interpretar el error de redondeo de la propia fórmula como resolución del buffer. También merece la pena graficar ~z(d)~ y ~z_r(d)~ frente a ~d~ en escala logarítmica.
+
+* Limitaciones y decisiones de ingeniería
+
+La precisión de profundidad no es una propiedad aislada del formato. Depende de la matriz, de los planos de recorte, de cómo se transforma el espacio, de la representación numérica y de cómo se compara cada muestra. Por eso conviene diagnosticar en este orden: confirmar que existe un attachment de profundidad; comprobar limpieza, comparación y escrituras; visualizar la profundidad; revisar ~near/far~; identificar caras coplanares; y solo después aumentar bits o introducir bias.
+
+Hay otras distinciones importantes. El Z-buffer no realiza por sí mismo /culling/ de geometría fuera del frustum. Un depth pre-pass no garantiza mejor rendimiento. Reversed-Z no reemplaza el clipping cercano ni resuelve transparencias. Y un ejemplo de rasterizador software no reproduce las reglas de precisión y cobertura de una GPU comercial.
+
+En motores retro o plataformas limitadas, el compromiso puede ser distinto. Un mundo organizado en sectores, portales o BSP puede reducir muchísimo el trabajo sin necesitar un buffer profundo para cada píxel. En una GPU actual, las unidades dedicadas y las optimizaciones jerárquicas hacen que la profundidad sea una herramienta barata en muchos escenarios, aunque nunca gratuita. La elección correcta depende de la arquitectura y del perfil de la escena.
+
+* Conclusión
+
+La eliminación de superficies ocultas resume una evolución importante de los gráficos por computador. Los motores software de los noventa intentaban decidir con inteligencia qué píxeles merecía la pena dibujar; el hardware 3D popularizó la comparación de profundidad por muestra; y los motores modernos siguen refinando el mismo mecanismo mediante early-Z, estructuras jerárquicas y reversed-Z.
+
+La parte más sorprendente es matemática: un buffer de 16, 24 o 32 bits no equivale a repartir uniformemente esa precisión a lo largo de los metros de la escena. La proyección perspectiva transforma la distancia mediante ~1/d~, y la codificación numérica determina qué diferencias podemos conservar. Entenderlo permite corregir Z-fighting, diseñar cámaras robustas y evaluar con criterio los compromisos entre ordenamiento, memoria y sombreado.
+
+* Fuentes y lecturas originales
+
+- Michael Abrash, /Graphics Programming Black Book/, capítulo 70: discusión de los spans del mundo y el Z-buffer para modelos en Quake. [[https://github.com/jagregory/abrash-black-book/blob/master/src/chapter-70.md][Texto del capítulo 70]].
+- Michael Abrash, capítulo 67: ordenamiento BSP y spans, con contexto del desarrollo de Quake. [[https://github.com/jagregory/abrash-black-book/blob/master/src/chapter-67.md][Texto del capítulo 67]].
+- Khronos OpenGL Wiki, /Depth Buffer Precision/: derivación y ejemplo numérico de 16 bits. [[https://wikis.khronos.org/opengl/Depth_Buffer_Precision][Depth Buffer Precision]].
+- Khronos OpenGL Wiki, /Depth Test/: comparaciones, escrituras y early depth testing. [[https://wikis.khronos.org/opengl/Depth_Test][Depth Test]].
+- Khronos OpenGL Wiki, /glDepthRange/: transformación del intervalo NDC a profundidad de ventana. [[https://wikis.khronos.org/opengl/GLAPI/glDepthRange][glDepthRange]].
+- Microsoft Learn, /Depth Buffering State (Direct3D 9)/: estados de profundidad y bias. [[https://learn.microsoft.com/en-us/windows/win32/direct3d9/depth-buffering-state][Depth Buffering State]].
+- Microsoft Learn, /Enabling Depth Buffering (Direct3D 9)/: configuración y W-buffer. [[https://learn.microsoft.com/en-us/windows/win32/direct3d9/enabling-depth-buffering][Enabling Depth Buffering]].
+
+Las referencias históricas describen las decisiones de sus autores en su contexto; las implementaciones C++ y las derivaciones del artículo son ejemplos explicativos propios. No se incluyen imágenes externas ni materiales de terceros en el repositorio.
