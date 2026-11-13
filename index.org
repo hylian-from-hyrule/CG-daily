@@ -4,6 +4,7 @@
 
 * 2026
 ** Noviembre
+- <2026-11-13 Fri> [[file:articulos/2026/11/2026-11-13-mipmaps-filtrado-anisotropico.org][Mipmaps: por qué una textura lejana parpadea y cómo lo resolvieron las GPU]] :historia:rasterizacion:texturas:
 - <2026-11-12 Thu> [[file:articulos/2026/11/2026-11-12-zbuffer-precision-reversed-z.org][Del Z-buffer de los noventa al reversed-Z: cómo decide un motor qué superficie vemos]] :historia:gpu:profundidad:
 - <2026-11-11 Wed> [[file:articulos/2026/11/2026-11-11-quake-texturas-perspectiva.org][Cómo Quake conseguía texturas con perspectiva sin una GPU]] :retro:rasterizacion:quake:
 
