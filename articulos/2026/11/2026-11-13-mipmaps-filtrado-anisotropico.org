@@ -1,0 +1,286 @@
+#+TITLE: Mipmaps: por qué una textura lejana parpadea y cómo lo resolvieron las GPU
+#+DATE: <2026-11-13 Fri>
+#+LANGUAGE: es
+#+OPTIONS: toc:2 num:t
+#+FILETAGS: :historia:rasterizacion:texturas:gpu:opengl:
+
+* De la textura nítida al suelo que parpadea :historia:
+En una escena tridimensional de 1996, un pasillo podía parecer razonablemente convincente al mirar una pared de frente y convertirse en un festival de puntos brillantes al avanzar. El suelo de baldosas vibraba; las rejillas cambiaban de forma entre fotogramas; una pared de ladrillos lejana producía dibujos que no existían en la textura original. No era necesariamente un error del cálculo de perspectiva. Era un problema más fundamental: estábamos intentando representar miles de muestras de una imagen con apenas unos píxeles.
+
+Durante la transición de los renderizadores software a las aceleradoras 3D de consumo, términos como /bilinear/, /trilinear/ y /mipmapping/ aparecieron en cajas de tarjetas gráficas y menús de juegos. A menudo se confundían con una sola idea, «suavizar texturas», pero resuelven problemas diferentes. El filtrado bilineal interpola entre texeles próximos; el mipmapping proporciona imágenes previamente reducidas para que el muestreo lejano no pierda información de manera arbitraria; el filtrado trilineal disimula el salto entre niveles; y el anisotrópico afronta la geometría oblicua, donde la huella de un píxel deja de ser aproximadamente cuadrada.
+
+La idea fundamental del mipmapping es anterior a las tarjetas 3D domésticas. Lance Williams describió las /pyramidal parametrics/ en SIGGRAPH 1983: organizar versiones de una imagen a varias escalas para aproximar un filtrado dependiente del tamaño de proyección [fn:1]. Su importancia práctica aumentó cuando el hardware de texturas permitió seleccionar niveles e interpolar de manera barata. Entenderlo también ayuda a escribir un rasterizador software, a configurar correctamente OpenGL y a diagnosticar problemas de calidad en motores modernos.
+
+* El problema real: muestreo, no falta de interpolación
+** De la imagen continua a los texeles
+Imaginemos una textura de tablero de ajedrez de 1024 × 1024 texeles aplicada a un suelo. Cuando ocupa 1024 píxeles de ancho, una relación cercana a un texel por píxel permite reconocer el patrón. Cuando ocupa 64 píxeles, cada píxel representa aproximadamente 16 texeles en horizontal. Si además la superficie está inclinada, puede abarcar muchos más en la dirección de profundidad.
+
+La operación ideal no consiste en escoger «el texel más próximo» al centro del píxel, sino en integrar la señal de textura sobre la región que ese píxel proyecta en la superficie:
+
+\[
+C_p = \frac{1}{|A_p|}\int_{A_p} T(u,v)\,du\,dv.
+\]
+
+Aquí \(A_p\) es la huella del píxel en coordenadas de textura y \(T\) es la señal de color. Esta expresión es una idealización: la cobertura, la reconstrucción del píxel, la perspectiva y la iluminación pueden introducir pesos adicionales. Pero revela por qué tomar una sola muestra es insuficiente: el píxel resume un área, no un punto.
+
+** Aliasing y el límite de Nyquist
+Un patrón alternante blanco-negro cambia de valor cada texel. Si lo reducimos mucho y muestreamos únicamente centros, pequeñas variaciones de cámara pueden cambiar de golpe el color seleccionado. Aparecen aliasing espacial, moiré y /shimmering/ temporal. La teoría de muestreo exige eliminar las frecuencias superiores a la mitad de la frecuencia de muestreo antes de reducir una señal. En imágenes bidimensionales esto significa aplicar un filtro de paso bajo antes del submuestreo.
+
+Un ejemplo numérico: una secuencia de 64 texeles alternos se representa con cuatro píxeles. Escoger uno de cada 16 texeles puede dar cuatro píxeles blancos, cuatro negros o una combinación dependiente de la fase. Un promedio sobre cada bloque de 16 produce gris medio, que es la representación estable de esa región a escala reducida. Hemos perdido detalle, inevitablemente, pero evitado inventar estructura falsa.
+
+** Por qué bilinear no basta
+El bilinear toma cuatro texeles del MISMO nivel y los combina. Para coordenadas fraccionarias \((a,b)\), con \(a,b\) entre cero y uno:
+
+\[
+C=(1-b)[(1-a)C_{00}+aC_{10}]+b[(1-a)C_{01}+aC_{11}].
+\]
+
+Esto elimina discontinuidades al desplazarnos entre centros de texeles, especialmente cuando magnificamos una imagen. Pero cuando un píxel cubre 16 × 16 texeles, cuatro muestras locales no representan sus 256 contribuciones. El resultado puede ser suave en cada instante y seguir parpadeando al mover la cámara. Es una diferencia esencial: /interpolar/ no equivale a /prefiltrar/.
+
+* La pirámide mipmap
+** Construcción y coste de memoria
+Un mipmap es una cadena de imágenes, cada una con aproximadamente la mitad de anchura y altura de la anterior. Una textura cuadrada de 1024 × 1024 produce niveles de 512, 256, 128, ..., 2 y 1 píxel de lado. En cada reducción se aplica un filtro para limitar frecuencias antes de descartar muestras.
+
+Para una textura cuadrada cuyo lado es potencia de dos, la suma de superficies es:
+
+\[
+N^2+\frac{N^2}{4}+\frac{N^2}{16}+\cdots
+=N^2\sum_{k=0}^{\infty}4^{-k}
+=\frac{4}{3}N^2.
+\]
+
+Por tanto, la cadena completa consume aproximadamente un 33,3 % más memoria que el nivel original, no el doble. Para RGBA8 de 1024 × 1024: el nivel base ocupa 4 MiB; la cadena completa se aproxima a 5,33 MiB. La suma finita difiere ligeramente de la serie infinita.
+
+Esta inversión es particularmente interesante en hardware: cuando un objeto lejano necesita datos de baja frecuencia, acceder a una imagen pequeña mejora la localidad de caché. No es solo una técnica de calidad visual. Las recomendaciones de rendimiento de NVIDIA destacan explícitamente esa mejora de utilización de caché [fn:2].
+
+** Cómo construirla en C++
+Este ejemplo usa RGBA8 y un promedio de cuatro texeles. Es deliberadamente didáctico: para imágenes fotográficas en sRGB conviene convertir a espacio lineal antes de promediar, y los mapas normales requieren tratamiento especial.
+
+#+begin_src cpp
+#include <algorithm>
+#include <cstdint>
+#include <vector>
+
+struct Image {
+    int width, height;
+    std::vector<std::uint8_t> rgba; // 4 canales, filas consecutivas
+};
+
+Image downsample_box(const Image& src) {
+    Image dst{
+        std::max(1, src.width / 2),
+        std::max(1, src.height / 2),
+        {}
+    };
+    dst.rgba.resize(dst.width * dst.height * 4);
+
+    for (int y = 0; y < dst.height; ++y) {
+        for (int x = 0; x < dst.width; ++x) {
+            for (int c = 0; c < 4; ++c) {
+                int sum = 0;
+                int count = 0;
+                for (int dy = 0; dy < 2; ++dy) {
+                    for (int dx = 0; dx < 2; ++dx) {
+                        int sx = std::min(2*x + dx, src.width - 1);
+                        int sy = std::min(2*y + dy, src.height - 1);
+                        sum += src.rgba[(sy*src.width + sx)*4 + c];
+                        ++count;
+                    }
+                }
+                dst.rgba[(y*dst.width + x)*4 + c] =
+                    static_cast<std::uint8_t>((sum + count/2)/count);
+            }
+        }
+    }
+    return dst;
+}
+
+std::vector<Image> make_mips(Image base) {
+    std::vector<Image> levels;
+    levels.push_back(std::move(base));
+    while (levels.back().width > 1 || levels.back().height > 1)
+        levels.push_back(downsample_box(levels.back()));
+    return levels;
+}
+#+end_src
+
+El ejemplo evita accesos fuera de rango, pero para dimensiones impares el reparto de texeles no es un filtro de reducción ideal: el último texel puede quedar infrarrepresentado o repetido. En un sistema de producción conviene usar una rutina de redimensionado con soporte bien definido y tratamiento de bordes. Para texturas de color, la media aritmética de valores sRGB es físicamente incorrecta: antes hay que decodificar la función de transferencia, promediar en lineal y volver a codificar. Tampoco se deben promediar normales XYZ codificadas como colores y dar el resultado por válido sin renormalizar.
+
+** Elegir el nivel: el LOD
+Si la huella de un píxel equivale aproximadamente a \(\rho\) texeles del nivel base en su dimensión dominante, elegimos:
+
+\[
+\lambda = \log_2(\rho).
+\]
+
+Cuando \(\rho=1\), el nivel apropiado es cero. Cuando \(\rho=8\), elegimos el nivel tres porque cada texel de ese nivel resume aproximadamente 8 × 8 texeles originales. Si \(\rho=6\), el nivel continuo es \(\log_2 6 \approx 2,585\).
+
+¿Cómo calcula una GPU esa huella? En un fragment shader, las coordenadas de textura varían sobre la pantalla. Sus derivadas respecto a \(x\) e \(y\) dan una aproximación local del cambio por píxel. Para una textura de anchura \(W\) y altura \(H\):
+
+\[
+\mathbf{d}_x=(W\,\partial u/\partial x,\ H\,\partial v/\partial x),
+\quad
+\mathbf{d}_y=(W\,\partial u/\partial y,\ H\,\partial v/\partial y).
+\]
+
+Una aproximación isotrópica frecuente es \(\rho=\max(\|\mathbf{d}_x\|,\|\mathbf{d}_y\|)\). La elección exacta de derivadas, precisión, sesgo y reglas de filtrado depende de la API y la implementación; no debemos confundir esta fórmula pedagógica con una promesa bit a bit del hardware.
+
+Por ejemplo, si un píxel avanza 0,004 unidades en \(u\) y 0,002 en \(v\), con una textura 1024 × 512, el vector de diferencia horizontal en texeles es \((4,096,1,024)\), cuya longitud es aproximadamente 4,22. Si la derivada vertical tiene longitud menor, el LOD será aproximadamente 2,08. El sampler mezclará normalmente niveles dos y tres si usamos filtrado trilineal.
+
+* Bilinear, trilinear y anisotrópico: tres respuestas distintas
+** Bilinear: reconstruir dentro de un nivel
+Al acercarnos a una pared, varios píxeles pueden corresponder a un solo texel. Nearest-neighbor muestra bloques de color; bilinear interpola cuatro valores y reduce el aspecto cuadriculado. En pixel art puede interesar preservar los bloques, de modo que «más suave» no es siempre «más correcto».
+
+** Trilinear: interpolar entre escalas
+Con bilinear más selección del mipmap entero más cercano, el cambio de nivel puede verse como una banda repentina sobre el suelo. Trilinear calcula un bilinear en el nivel \(\lfloor\lambda\rfloor\), otro en el nivel \(\lceil\lambda\rceil\), y mezcla ambos con \(t=\lambda-\lfloor\lambda\rfloor\):
+
+\[
+C=(1-t)C_{\lfloor\lambda\rfloor}+tC_{\lceil\lambda\rceil}.
+\]
+
+Conceptualmente puede necesitar ocho contribuciones de texeles (cuatro por nivel), aunque el coste real de hardware no se deduce directamente de contar esas contribuciones. La transición de escala es continua, pero la calidad sigue limitada por la forma de la huella y por el prefiltrado de los mipmaps.
+
+** Anisotropía: el problema del suelo oblicuo
+Un píxel proyectado sobre una pared frontal cubre una región relativamente compacta de textura. Sobre un suelo que se aleja hacia el horizonte, su huella se alarga mucho en una dirección. Si elegimos el mipmap basándonos solo en la dimensión mayor, suavizamos en exceso la dirección corta: las líneas laterales pierden detalle. Si elegimos la menor, aparece aliasing en la larga.
+
+El filtrado anisotrópico aproxima mejor esa huella alargada mediante múltiples muestras distribuidas a lo largo del eje mayor, con una escala apropiada en el menor. La cantidad y distribución exacta dependen del hardware, del grado de anisotropía y de la implementación. El factor «16×» no significa que toda muestra consista siempre en dieciséis operaciones idénticas.
+
+Matemáticamente, podemos analizar la transformación local entre pantalla y textura con un jacobiano:
+
+\[
+J=\begin{bmatrix}
+W u_x & W u_y\\
+H v_x & H v_y
+\end{bmatrix}.
+\]
+
+Sus valores singulares \(\sigma_1\geq\sigma_2\) describen las escalas principales de la huella aproximada; la razón \(\sigma_1/\sigma_2\) mide su anisotropía. Esta interpretación explica por qué dos superficies con igual área proyectada pueden requerir filtros muy distintos: el área depende del producto de escalas, pero el aspecto de la huella depende de su cociente.
+
+No todos los filtros anisotrópicos evalúan una descomposición SVD explícita. Es una herramienta matemática para entender el problema, no una descripción literal de los circuitos. Técnicas más costosas, como /elliptical weighted average/ (EWA), intentan aproximar mejor la integración sobre huellas elípticas.
+
+* La perspectiva entra en el cálculo
+En un rasterizador software, interpolar \(u,v\) directamente en pantalla produce distorsión sobre triángulos en perspectiva. Debemos interpolar \(u/w\), \(v/w\) y \(1/w\), y recuperar:
+
+\[
+u(x,y)=\frac{(u/w)(x,y)}{(1/w)(x,y)},\qquad
+v(x,y)=\frac{(v/w)(x,y)}{(1/w)(x,y)}.
+\]
+
+Esto tiene consecuencias para el LOD: las derivadas de \(u,v\) no son constantes dentro del triángulo, aunque las cantidades que interpolamos en pantalla sean afines. Por la regla del cociente, si \(a=u/w\) y \(q=1/w\):
+
+\[
+\frac{\partial u}{\partial x}
+=\frac{q\,\partial a/\partial x-a\,\partial q/\partial x}{q^2}.
+\]
+
+El mismo procedimiento se aplica a \(v\) y a \(y\). En un rasterizador propio podemos calcular estas derivadas analíticamente a partir de los planos interpolados o aproximarlas mediante diferencias finitas entre píxeles vecinos. La segunda opción debe tratar con cuidado bordes de triángulo y fragmentos no cubiertos.
+
+Las GPU modernas suelen calcular derivadas implícitas sobre grupos de invocaciones vecinas, lo que explica restricciones prácticas: ciertas llamadas de muestreo con LOD implícito en control de flujo no uniforme pueden dar derivadas indefinidas o resultados no deseados según la API. Si el programa conoce el gradiente, puede proporcionarlo explícitamente.
+
+* Implementación con OpenGL moderno
+** Crear la cadena y configurar el sampler
+El siguiente fragmento usa funciones DSA de OpenGL 4.5. Se supone que existe un contexto válido, que =pixels= apunta a =width*height*4= bytes RGBA8 y que el cargador de funciones está inicializado.
+
+#+begin_src cpp
+#include <algorithm>
+#include <cmath>
+#include <GL/glcorearb.h>
+
+GLuint create_texture_rgba8(int width, int height,
+                            const unsigned char* pixels) {
+    const int levels = 1 + static_cast<int>(
+        std::floor(std::log2(std::max(width, height))));
+
+    GLuint texture = 0;
+    glCreateTextures(GL_TEXTURE_2D, 1, &texture);
+    glTextureStorage2D(texture, levels, GL_RGBA8, width, height);
+    glTextureSubImage2D(texture, 0, 0, 0, width, height,
+                        GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    glGenerateTextureMipmap(texture);
+
+    glTextureParameteri(texture, GL_TEXTURE_MIN_FILTER,
+                        GL_LINEAR_MIPMAP_LINEAR);
+    glTextureParameteri(texture, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTextureParameteri(texture, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTextureParameteri(texture, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    return texture;
+}
+#+end_src
+
+En una aplicación real, =glcorearb.h= solo declara la interfaz: hay que obtener los punteros de función con el cargador correspondiente o usar un cargador generado. =glTextureStorage2D= reserva todos los niveles; =glGenerateTextureMipmap= genera sus contenidos. El código no gestiona errores ni restaura el estado global de alineación de píxeles. RGBA8 tiene filas de cuatro bytes por píxel, por lo que la alineación por defecto no introduce el problema típico de RGB8 con anchuras impares.
+
+Si queremos prefiltrar correctamente una textura sRGB, el formato =GL_SRGB8_ALPHA8= expresa la semántica de color para las operaciones compatibles; hay que verificar el comportamiento de generación de mipmaps y la ruta de carga. No debe utilizarse ese formato para mapas de normales o datos arbitrarios.
+
+** Derivadas en GLSL y LOD explícito
+#+begin_src glsl
+#version 450 core
+layout(binding = 0) uniform sampler2D albedo;
+in vec2 uv;
+out vec4 color;
+
+void main() {
+    vec2 dx = dFdx(uv);
+    vec2 dy = dFdy(uv);
+
+    // Gradientes en coordenadas normalizadas; el sampler
+    // conoce las dimensiones de la textura.
+    color = textureGrad(albedo, uv, dx, dy);
+}
+#+end_src
+
+=textureGrad= es útil cuando necesitamos controlar qué derivadas llegan al sampler, por ejemplo al modificar coordenadas en un shader. Para el caso ordinario, =texture(albedo, uv)= permite que el hardware estime el LOD automáticamente. =textureLod= fija directamente el nivel y es útil para depuración, pero desactiva la selección automática según la huella.
+
+** Filtrado anisotrópico
+En OpenGL, el control de anisotropía está disponible mediante la extensión =GL_EXT_texture_filter_anisotropic= (o su integración correspondiente en versiones y plataformas que la soporten). Tras comprobar soporte y límite:
+
+#+begin_src cpp
+// Requiere definiciones de GL_TEXTURE_MAX_ANISOTROPY_EXT
+// y GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, además de soporte real.
+GLfloat maximum = 1.0f;
+glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maximum);
+glTextureParameterf(texture, GL_TEXTURE_MAX_ANISOTROPY_EXT,
+                    std::min(8.0f, maximum));
+#+end_src
+
+El parámetro solicita un límite de anisotropía, no garantiza un patrón exacto de muestras. El filtrado trilineal sigue siendo una configuración útil del filtro de minificación.
+
+* De OpenGL fijo a los shaders programables
+En OpenGL 1.x y Direct3D de finales de los noventa, la aplicación controlaba filtros y estados de textura, pero no escribía un fragment shader arbitrario. Las unidades de textura eran bloques especializados: recibían coordenadas, determinaban la escala y devolvían muestras filtradas. La aparición de pixel shaders no eliminó esas unidades; las integró en una arquitectura programable donde las instrucciones de muestreo cooperan con hardware dedicado.
+
+Esto explica una peculiaridad moderna: el shader puede ejecutar operaciones matemáticas generales sobre UV, pero una lectura =texture()= sigue siendo una operación con semántica compleja. Debe considerar tipo y formato de textura, modos de direccionamiento, LOD, filtros, posibles niveles mipmap, compresión y cachés. Las API modernas, como Vulkan, separan el objeto imagen del objeto sampler; en OpenGL también existen sampler objects, que permiten reutilizar configuraciones de filtrado sin duplicar texturas.
+
+El coste de filtrar no se mide únicamente en instrucciones ALU. Una textura mal elegida puede aumentar tráfico de memoria, desperdiciar caché y hacer más lento un shader aparentemente sencillo. En un motor, la resolución útil de una textura depende de cuántos texeles llegan realmente a proyectarse en pantalla. /GPU Gems 2/ propone medir los niveles visibles con texturas de calibración y consultas de oclusión; relata ahorros importantes de memoria en un caso de terreno concreto, que no deben extrapolarse a cualquier escena [fn:3].
+
+* Problemas que sobreviven al mipmapping
+** Transparencia y cobertura
+Promediar alfa como si fuera simplemente otro canal puede producir halos en bordes de sprites. Con alfa no premultiplicado, conviene filtrar colores premultiplicados por alfa y reconstruir con cuidado. En vegetación recortada mediante alpha test, la reducción puede cambiar la cobertura de hojas: los mipmaps convencionales tienden a adelgazar o engordar siluetas. Existen técnicas de preservación de cobertura por nivel.
+
+** Mapas normales y rugosidad
+Un normal map codifica direcciones, no colores. Promediar vectores puede acortar su longitud; normalizar al final evita un error inmediato, pero no reproduce toda la distribución de microorientaciones. Una superficie con normales muy variables puede requerir mayor rugosidad efectiva al alejarse para evitar brillos especulares intermitentes. La solución implica prefiltrado adaptado al significado físico de los datos, no solo cambiar el filtro del sampler.
+
+** Texturas repetidas y atlas
+Los mipmaps se construyen a partir de vecindades de texeles. Si dos sprites ocupan regiones adyacentes de un atlas, sus colores pueden mezclarse en niveles reducidos y aparecer bordes contaminados. Es necesario introducir /padding/, replicar bordes o construir los niveles respetando cada región. En texturas periódicas, el filtrado de bordes debe respetar la repetición.
+
+** Temporalidad y sesgo de LOD
+Un sesgo negativo de LOD selecciona niveles más detallados y puede parecer «más nítido» en una captura, pero incrementa aliasing y parpadeo en movimiento. Un sesgo positivo estabiliza a costa de difuminar. El filtrado anisotrópico suele ser una respuesta más adecuada a superficies inclinadas que desactivar mipmaps. Técnicas temporales como TAA modifican el equilibrio entre nitidez y estabilidad, pero no sustituyen un prefiltrado espacial correcto.
+
+* Experimento reproducible para un motor propio
+Construye una escena con un plano de 100 × 100 unidades y una textura de cuadrícula de 1024 × 1024, repetida diez veces por eje. Sitúa la cámara a 1,6 unidades del suelo, mirando casi paralela al plano. Permite alternar cinco configuraciones: nearest sin mipmaps, bilinear sin mipmaps, nearest mipmap nearest, trilinear y trilinear con anisotropía 8×. Muévete lentamente hacia delante y observa la zona del horizonte, no solo el primer plano.
+
+Para depurar el nivel elegido, sustituye cada mipmap por un color sólido diferente. En el modo trilineal verás bandas con transiciones mezcladas; con anisotropía la selección puede cambiar según orientación y la implementación. Una segunda prueba consiste en capturar una secuencia de fotogramas y medir variaciones de luminancia de una región fija. La estabilidad temporal mejora normalmente al usar prefiltrado apropiado, aunque el resultado concreto depende del patrón, la cámara y el hardware.
+
+También merece la pena implementar una cadena mipmap en un rasterizador software C++: interpolar \(u/w,v/w,1/w\), estimar gradientes, calcular \(\lambda\) y hacer dos búsquedas bilineales. Comparar contra OpenGL mostrará diferencias de reglas de bordes, precisión, filtros de construcción y selección de LOD. No hay que esperar coincidencia píxel a píxel para validar que ambos siguen el mismo principio.
+
+* Conclusiones
+La textura lejana que parpadea es un problema de teoría de señales disfrazado de problema de gráficos 3D. La interpolación bilineal hace continuas las muestras locales; el mipmapping prefiltra a varias escalas; el trilineal suaviza la transición entre escalas; y la anisotropía trata la huella alargada que aparece al mirar superficies oblicuas. Cada mecanismo responde a una pregunta distinta.
+
+La lección histórica es que una idea formulada en 1983 se convirtió en una función de hardware fundamental durante la aceleración 3D de los noventa y sigue siendo central en las GPU actuales. La lección de ingeniería es más amplia: una textura no es siempre una fotografía. Colores, normales, máscaras y parámetros materiales requieren filtros coherentes con el significado de sus datos. Y la lección de rendimiento es que reducir correctamente una señal puede mejorar simultáneamente calidad, estabilidad y localidad de memoria.
+
+* Referencias originales y documentación
+- [fn:1] Lance Williams, /Pyramidal Parametrics/, SIGGRAPH 1983. DOI y registro bibliográfico: [[https://doi.org/10.1145/964967.801126][DOI 10.1145/964967.801126]].
+- [fn:2] NVIDIA, /Graphics Pipeline Performance/, sección 28.3.5 sobre mipmapping y caché: [[https://http.download.nvidia.com/developer/GPU_Gems_2/CD/Resources/Graphics_Pipeline_Performance.pdf][PDF original]].
+- [fn:3] Iain Cantlay, /Mipmap-Level Measurement/, GPU Gems 2, capítulo 28: [[https://developer.nvidia.com/gpugems/gpugems2/part-iii-high-quality-rendering/chapter-28-mipmap-level-measurement][NVIDIA Developer]].
+- Khronos/OpenGL, referencia de parámetros de textura y filtros: [[https://docs.gl/gl4/glTexParameter][glTexParameter]].
+- Khronos/OpenGL, referencia de sampler objects: [[https://docs.gl/gl4/glSamplerParameter][glSamplerParameter]].
+- Justin Novosad, /Advanced High-Quality Filtering/, GPU Gems 2, capítulo 27: [[https://developer.nvidia.com/gpugems/gpugems2/part-iii-high-quality-rendering/chapter-27-advanced-high-quality-filtering][NVIDIA Developer]].
+- Christian Sigg y Markus Hadwiger, /Fast Third-Order Texture Filtering/, GPU Gems 2, capítulo 20: [[https://developer.nvidia.com/gpugems/gpugems2/part-iii-high-quality-rendering/chapter-20-fast-third-order-texture-filtering][NVIDIA Developer]].
