@@ -277,9 +277,9 @@ La textura lejana que parpadea es un problema de teoría de señales disfrazado 
 La lección histórica es que una idea formulada en 1983 se convirtió en una función de hardware fundamental durante la aceleración 3D de los noventa y sigue siendo central en las GPU actuales. La lección de ingeniería es más amplia: una textura no es siempre una fotografía. Colores, normales, máscaras y parámetros materiales requieren filtros coherentes con el significado de sus datos. Y la lección de rendimiento es que reducir correctamente una señal puede mejorar simultáneamente calidad, estabilidad y localidad de memoria.
 
 * Referencias originales y documentación
-- [fn:1] Lance Williams, /Pyramidal Parametrics/, SIGGRAPH 1983. DOI y registro bibliográfico: [[https://doi.org/10.1145/964967.801126][DOI 10.1145/964967.801126]].
-- [fn:2] NVIDIA, /Graphics Pipeline Performance/, sección 28.3.5 sobre mipmapping y caché: [[https://http.download.nvidia.com/developer/GPU_Gems_2/CD/Resources/Graphics_Pipeline_Performance.pdf][PDF original]].
-- [fn:3] Iain Cantlay, /Mipmap-Level Measurement/, GPU Gems 2, capítulo 28: [[https://developer.nvidia.com/gpugems/gpugems2/part-iii-high-quality-rendering/chapter-28-mipmap-level-measurement][NVIDIA Developer]].
+[fn:1] Lance Williams, /Pyramidal Parametrics/, SIGGRAPH 1983. DOI y registro bibliográfico: [[https://doi.org/10.1145/964967.801126][DOI 10.1145/964967.801126]].
+[fn:2] NVIDIA, /Graphics Pipeline Performance/, sección 28.3.5 sobre mipmapping y caché: [[https://http.download.nvidia.com/developer/GPU_Gems_2/CD/Resources/Graphics_Pipeline_Performance.pdf][PDF original]].
+[fn:3] Iain Cantlay, /Mipmap-Level Measurement/, GPU Gems 2, capítulo 28: [[https://developer.nvidia.com/gpugems/gpugems2/part-iii-high-quality-rendering/chapter-28-mipmap-level-measurement][NVIDIA Developer]].
 - Khronos/OpenGL, referencia de parámetros de textura y filtros: [[https://docs.gl/gl4/glTexParameter][glTexParameter]].
 - Khronos/OpenGL, referencia de sampler objects: [[https://docs.gl/gl4/glSamplerParameter][glSamplerParameter]].
 - Justin Novosad, /Advanced High-Quality Filtering/, GPU Gems 2, capítulo 27: [[https://developer.nvidia.com/gpugems/gpugems2/part-iii-high-quality-rendering/chapter-27-advanced-high-quality-filtering][NVIDIA Developer]].
