@@ -1,0 +1,39 @@
+% Monthly CG-daily book style. XeLaTeX via Org's ox-latex.
+\usepackage[a4paper,top=27mm,bottom=29mm,inner=28mm,outer=26mm,headheight=15pt]{geometry}
+\usepackage{fontspec}
+\setmainfont{TeX Gyre Pagella}
+\setsansfont{Lato}
+\setmonofont[Scale=0.83]{DejaVu Sans Mono}
+\usepackage{microtype}
+\usepackage{setspace}
+\setstretch{1.16}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.65em}
+\usepackage{xcolor}
+\definecolor{CGNavy}{HTML}{17324D}
+\definecolor{CGBlue}{HTML}{22699A}
+\definecolor{CGMuted}{HTML}{526477}
+\definecolor{CGCodeBg}{HTML}{F3F6F8}
+\usepackage{titlesec}
+\titleformat{\chapter}[display]
+  {\normalfont\sffamily\bfseries\color{CGNavy}}
+  {\large\color{CGBlue}\chaptertitlename\ \thechapter}
+  {0.7em}{\Huge}
+\titlespacing*{\chapter}{0pt}{-8pt}{27pt}
+\titleformat{\section}{\Large\sffamily\bfseries\color{CGNavy}}{\thesection}{0.8em}{}
+\titlespacing*{\section}{0pt}{2.1em}{0.8em}
+\titleformat{\subsection}{\large\sffamily\bfseries\color{CGBlue}}{\thesubsection}{0.7em}{}
+\titlespacing*{\subsection}{0pt}{1.5em}{0.6em}
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[LE,RO]{\sffamily\small\color{CGMuted}\thepage}
+\fancyhead[LO]{\sffamily\small\color{CGMuted}\nouppercase{\rightmark}}
+\fancyhead[RE]{\sffamily\small\color{CGMuted}\nouppercase{\leftmark}}
+\renewcommand{\headrulewidth}{0pt}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\sffamily\small\color{CGMuted}\thepage}\renewcommand{\headrulewidth}{0pt}}
+\usepackage{enumitem}
+\setlist{itemsep=0.35em,topsep=0.65em}
+\usepackage{etoolbox}
+\AtBeginEnvironment{quote}{\color{CGMuted}}
+\hypersetup{colorlinks=true,linkcolor=CGBlue,urlcolor=CGBlue,citecolor=CGBlue}
