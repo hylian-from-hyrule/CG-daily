@@ -27,7 +27,7 @@ jobs:
             emacs-nox \
             texlive-xetex texlive-latex-extra \
             texlive-latex-recommended texlive-fonts-recommended \
-            texlive-lang-spanish texlive-plain-generic lmodern fonts-dejavu-core fonts-lato
+            texlive-lang-spanish texlive-plain-generic lmodern fonts-dejavu-core fonts-lato fonts-texgyre
 
       - name: Exportar con Org en modo batch
         env:
