@@ -1,0 +1,314 @@
+#+TITLE: PowerVR y Dreamcast: renderizar por teselas para no dibujar píxeles invisibles
+#+DATE: <2026-11-14 Sat>
+#+LANGUAGE: es
+#+FILETAGS: :historia:retro:gpu:powervr:arquitectura:rasterizacion:
+#+OPTIONS: toc:3 num:t
+
+* Introducción: el problema no era solamente contar polígonos
+En 1998, comparar aceleradoras 3D mediante «millones de polígonos por segundo» o «megapíxeles por segundo» parecía razonable. Pero un fotograma no es una colección de triángulos igualmente útiles. Una pared puede tapar veinte objetos, y esos objetos pueden seguir consumiendo interpolación, lecturas de textura y operaciones de color. Al mismo tiempo, cada acceso a memoria externa tenía un coste considerable frente a una operación sencilla realizada dentro del chip.
+
+La Dreamcast de Sega, presentada en Japón en 1998, incorporó un procesador gráfico PowerVR2 con una decisión arquitectónica muy distinta de la habitual: antes de aplicar texturas, agrupar la geometría por regiones de pantalla y determinar qué superficies opacas son visibles. Esta idea, conocida como /tile-based deferred rendering/ (TBDR), ayuda a explicar tanto sus resultados visuales como la continuidad de la familia PowerVR en dispositivos móviles. No es una curiosidad desaparecida: hoy seguimos organizando render passes y attachments para aprovechar memorias locales de tesela.
+
+El objetivo de este capítulo es reconstruir el razonamiento de diseño, derivar sus costes, implementar una versión educativa y distinguir cuidadosamente tres ideas que suelen confundirse: /tiling/, eliminación de superficies ocultas y /deferred shading/.
+
+* 1. El coste de un píxel que nadie verá
+** 1.1. Qué significa overdraw
+Supongamos que cuatro paredes cubren el mismo píxel. En un renderizador inmediato (/immediate-mode renderer/, IMR) ingenuo, cada triángulo puede generar un fragmento, consultar su textura, ejecutar iluminación, comparar profundidad y, si procede, actualizar color. Solo una pared termina visible.
+
+Definimos el factor de overdraw aproximado como
+
+\[
+O=\frac{N_{\mathrm{fragmentos\ procesados}}}{N_{\mathrm{pixeles\ finales\ cubiertos}}}.
+\]
+
+Si cuatro superficies cubren todos los píxeles y todas llegan a sombrearse, O=4. El coste de sombreado puede multiplicarse por cuatro aunque la imagen final solo contenga una superficie por píxel. En la práctica, el resultado depende del orden de dibujo, del descarte temprano por profundidad, de las máscaras, de la cobertura parcial y de cómo contabilicemos las muestras MSAA.
+
+** 1.2. Memoria frente a cómputo
+Una pantalla de 640 × 480 contiene 307.200 píxeles. Un buffer RGBA8888 ocupa 1.228.800 bytes (aproximadamente 1,17 MiB); un buffer de profundidad de 32 bits ocupa otro tanto. En un modelo simplificado, leer y escribir ambos para cada fragmento implica hasta 16 bytes de tráfico por fragmento, sin incluir texturas, cachés ni compresión.
+
+Con O=4, eso equivale a unos 19,7 MB por fotograma; a 60 Hz, aproximadamente 1,18 GB/s. No es una medición de una GPU concreta: la memoria caché, el Z-buffer comprimido, los rechazos tempranos y el patrón real de escritura cambian radicalmente estas cifras. Es una cota ilustrativa que muestra por qué el ancho de banda podía dominar.
+
+En una arquitectura por teselas, el color y la profundidad de una pequeña región permanecen en SRAM interna. La GPU escribe el resultado final una sola vez, o evita incluso esa escritura si puede demostrar que la región no ha cambiado.
+
+* 2. Tres arquitecturas distintas
+** 2.1. Renderizado inmediato
+En el modelo conceptual inmediato, el procesador recibe un triángulo, lo transforma, lo rasteriza y produce fragmentos. El siguiente triángulo puede sobrescribir píxeles anteriores. El Z-buffer permite corregir la visibilidad, pero no elimina automáticamente el trabajo de sombreado ya realizado.
+
+El /early-Z/ moderno puede descartar fragmentos antes del pixel shader cuando el estado lo permite. Por eso no es correcto afirmar que todas las GPU inmediatas actuales sombrean siempre todas las superficies ocultas.
+
+** 2.2. Tile-based rendering (TBR)
+El TBR divide la pantalla en regiones, registra qué primitivas intersectan cada región y procesa una región completa utilizando buffers locales. Reduce el tráfico externo de color y profundidad, pero no garantiza por sí solo que se evite sombrear fragmentos ocultos: un TBR puede recorrer sus triángulos en orden de envío.
+
+** 2.3. Tile-based deferred rendering (TBDR)
+PowerVR añade una fase de visibilidad previa al sombreado de superficies opacas. Primero averigua qué triángulo gana en cada muestra; después aplica texturas y sombreado a los supervivientes. Así se reduce tanto el tráfico de buffers como el trabajo de pixel shading.
+
+«Deferred» aquí no significa necesariamente el /deferred shading/ de motores modernos con G-buffer de normales, materiales y posiciones. En PowerVR describe principalmente el aplazamiento del sombreado hasta conocer la visibilidad. Confundir ambas técnicas lleva a deducir erróneamente que Dreamcast utilizaba un G-buffer de iluminación diferida.
+
+* 3. La Dreamcast como caso de estudio
+** 3.1. Del SH-4 al Tile Accelerator
+En Dreamcast, el procesador Hitachi SH-4 realiza buena parte de la transformación geométrica y entrega vértices ya preparados al subsistema PowerVR2. El /Tile Accelerator/ (TA) organiza primitivas y listas para las regiones de pantalla. No hay que imaginar una GPU programable con vertex shaders GLSL: el reparto entre CPU y hardware fijo era muy diferente.
+
+La implementación clásica trabaja con teselas de 32 × 32 píxeles. Para una imagen de 640 × 480, la cuadrícula contiene
+
+\[
+N_x=\lceil640/32\rceil=20,\quad
+N_y=\lceil480/32\rceil=15,\quad N=300.
+\]
+
+Cada tesela dispone de referencias a las primitivas que pueden cubrirla. El hardware necesita almacenar parámetros geométricos y listas; no guarda necesariamente copias completas de cada triángulo para cada tesela.
+
+** 3.2. ISP, TSP y listas
+El Image Synthesis Processor (ISP) resuelve visibilidad y pruebas asociadas; el Texture and Shading Processor (TSP) aplica texturas y color. Esta separación es la clave: la textura de una pared tapada puede no consultarse nunca.
+
+La API de bajo nivel diferencia categorías de primitivas: polígonos opacos, translúcidos, /punch-through/ (recorte binario de alfa) y listas relacionadas con /modifier volumes/. Estas categorías no son un capricho de la API: tienen necesidades distintas de orden, profundidad y composición.
+
+Las superficies opacas pueden resolverse por visibilidad. Para una superficie translúcida, en cambio, el color final depende de varias capas. En general,
+
+\[
+C_{out}=\alpha_f C_f+(1-\alpha_f)C_b.
+\]
+
+Intercambiar fondo y primer plano cambia el resultado. Por tanto, no basta con seleccionar «el fragmento más cercano». Dreamcast dispone de mecanismos y modos específicos de ordenación para transparencia; no debe afirmarse que cualquier combinación de transparencias se resuelve automáticamente y sin restricciones.
+
+** 3.3. Una consecuencia para el programador
+En una GPU inmediata clásica, ordenar los objetos opacos de delante hacia atrás podía aumentar la eficacia de early-Z. En PowerVR con eliminación de superficies ocultas, ordenar manualmente esos objetos puede aportar poco y consumir CPU. La propia Imagination recomienda evitar un depth pre-pass redundante en sus arquitecturas TBDR cuando el hardware ya realiza ese trabajo.
+
+La regla no se extiende a transparencias, efectos con descarte, escrituras de profundidad o dependencias especiales. Tampoco significa que cualquier carga geométrica sea gratuita: el TA todavía debe transformar, clasificar y almacenar primitivas.
+
+* 4. Cómo construir las listas de teselas
+** 4.1. Bounding boxes y binning
+Tras proyectar un triángulo a coordenadas de pantalla, calculamos su rectángulo envolvente:
+
+\[
+x_{min}=\min(x_0,x_1,x_2),\qquad x_{max}=\max(x_0,x_1,x_2),
+\]
+\[
+y_{min}=\min(y_0,y_1,y_2),\qquad y_{max}=\max(y_0,y_1,y_2).
+\]
+
+Para tamaño de tesela T, el rango candidato es
+
+\[
+t_{x0}=\lfloor x_{min}/T\rfloor,\quad
+t_{x1}=\lfloor x_{max}/T\rfloor,
+\]
+
+y análogamente para Y, acotando índices a la pantalla. Un rectángulo envolvente puede incluir teselas que el triángulo no toca; es una clasificación conservadora. Se puede refinar con pruebas triángulo-rectángulo, a costa de más trabajo en el binning.
+
+#+begin_src cpp
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <vector>
+
+struct Vertex { float x, y, z; };
+struct Triangle { std::array<Vertex, 3> v; uint32_t color; };
+
+struct Tiler {
+    static constexpr int width = 640;
+    static constexpr int height = 480;
+    static constexpr int tile = 32;
+    static constexpr int nx = (width + tile - 1) / tile;
+    static constexpr int ny = (height + tile - 1) / tile;
+    std::array<std::vector<uint32_t>, nx * ny> bins;
+
+    void add(uint32_t id, const Triangle& t) {
+        float x0 = std::min({t.v[0].x, t.v[1].x, t.v[2].x});
+        float x1 = std::max({t.v[0].x, t.v[1].x, t.v[2].x});
+        float y0 = std::min({t.v[0].y, t.v[1].y, t.v[2].y});
+        float y1 = std::max({t.v[0].y, t.v[1].y, t.v[2].y});
+        if (x1 < 0 || y1 < 0 || x0 >= width || y0 >= height)
+            return;
+        int ax = std::clamp(int(std::floor(x0 / tile)), 0, nx - 1);
+        int bx = std::clamp(int(std::floor(x1 / tile)), 0, nx - 1);
+        int ay = std::clamp(int(std::floor(y0 / tile)), 0, ny - 1);
+        int by = std::clamp(int(std::floor(y1 / tile)), 0, ny - 1);
+        for (int y = ay; y <= by; ++y)
+            for (int x = ax; x <= bx; ++x)
+                bins[y * nx + x].push_back(id);
+    }
+};
+#+end_src
+
+Este ejemplo usa identificadores y vectores dinámicos por claridad. Un motor real preferiría un almacenamiento contiguo con prefijos, listas compactadas o buffers preasignados, para evitar miles de pequeñas reservas y mejorar la localidad de memoria.
+
+** 4.2. Complejidad
+Con P triángulos y K referencias totales triángulo-tesela, la construcción cuesta aproximadamente O(P+K). K puede ser mucho mayor que P si hay triángulos gigantes. Un triángulo que cubre toda la pantalla aparece en 300 listas; miles de triángulos grandes pueden disparar memoria y trabajo de clasificación.
+
+Esta es una limitación importante: el tiling intercambia tráfico de framebuffer por almacenamiento de parámetros, trabajo de binning y sincronización entre fases.
+
+* 5. Rasterización local y visibilidad
+** 5.1. Ecuaciones de borde
+Para determinar si un punto P está dentro del triángulo ABC, podemos usar funciones de borde orientadas:
+
+\[
+E_{AB}(P)=(P_x-A_x)(B_y-A_y)-(P_y-A_y)(B_x-A_x).
+\]
+
+Según la orientación elegida, las tres funciones deben tener signos compatibles. En una implementación de producción se utiliza una regla consistente de inclusión de bordes, como /top-left/, para evitar grietas o doble cobertura entre triángulos adyacentes.
+
+Las coordenadas baricéntricas permiten interpolar profundidad:
+
+\[
+z(P)=\lambda_A z_A+\lambda_B z_B+\lambda_C z_C.
+\]
+
+Esto supone que z representa profundidad de ventana, que sí es afín en pantalla tras la transformación adecuada. Para interpolar UV y otros atributos de espacio de objeto con perspectiva hay que utilizar 1/w; no basta con interpolarlos linealmente en pantalla.
+
+** 5.2. Dos pasadas educativas
+Podemos simular la separación ISP/TSP con dos fases. La primera escribe el identificador ganador por píxel, sin texturizar. La segunda sombrea solo los píxeles con ganador.
+
+#+begin_src cpp
+#include <limits>
+#include <vector>
+#include <cstdint>
+
+struct Visibility {
+    int width, height;
+    std::vector<float> depth;
+    std::vector<int32_t> owner;
+
+    Visibility(int w, int h)
+        : width(w), height(h),
+          depth(size_t(w) * h, 1.0f),
+          owner(size_t(w) * h, -1) {}
+
+    void test(int x, int y, float z, int32_t triangle_id) {
+        size_t p = size_t(y) * width + x;
+        if (z < depth[p]) { // Convención: menor z = más cerca
+            depth[p] = z;
+            owner[p] = triangle_id;
+        }
+    }
+};
+
+template<class Shade>
+void shade_visible(const Visibility& vis,
+                   std::vector<uint32_t>& rgba, Shade shade) {
+    for (int y = 0; y < vis.height; ++y)
+        for (int x = 0; x < vis.width; ++x) {
+            size_t p = size_t(y) * vis.width + x;
+            if (vis.owner[p] >= 0)
+                rgba[p] = shade(vis.owner[p], x, y);
+        }
+}
+#+end_src
+
+Falta deliberadamente el bucle que evalúa cobertura y profundidad para cada triángulo de cada tesela: se implementa con las ecuaciones anteriores. También falta recuperar los atributos interpolados del triángulo ganador. El código muestra el principio, no emula la microarquitectura exacta de PowerVR.
+
+Si almacenamos identificadores de 32 bits y profundidad de 32 bits para 32 × 32 píxeles, el estado de visibilidad requiere 8 KiB, más el color final (4 KiB RGBA8). Esta cifra sirve para dimensionar una implementación hipotética, no para describir el tamaño real de la SRAM de Dreamcast.
+
+** 5.3. ¿Por qué no sombrear directamente?
+Porque si una pared lejana se dibuja primero, habremos ejecutado su shader y leído sus texturas antes de descubrir que otra pared la tapa. Separar visibilidad y color permite aplazar esas lecturas.
+
+El precio es que, en la fase de color, necesitamos reconstruir atributos del ganador, recuperar parámetros y respetar operaciones que no se pueden reordenar. Fragment shaders con efectos laterales, transparencias y descartes condicionados por texturas complican este modelo.
+
+* 6. Un cálculo de tráfico: qué ahorramos realmente
+Tomemos una imagen RGBA8 de 1280 × 720, profundidad de 32 bits y O=3. En un modelo ingenuo, cada fragmento genera una lectura y una escritura de color y profundidad:
+
+\[
+B_{IMR}\approx 1280\cdot720\cdot3\cdot16
+=44{,}24\ \mathrm{MB/fotograma}.
+\]
+
+Si un renderizador por teselas solo escribe una vez el color final, el tráfico mínimo de salida de color sería
+
+\[
+B_{color}\approx1280\cdot720\cdot4
+=3{,}69\ \mathrm{MB/fotograma}.
+\]
+
+La diferencia parece enorme, pero no es una comparación de rendimiento real: omitimos cargas previas de attachments, texturas, geometría, metadatos, buffers intermedios, cachés, compresión, MSAA y costes de binning. Tampoco todos los IMR hacen lecturas/escrituras externas por fragmento. El modelo es útil para identificar el tipo de tráfico que se pretende evitar, no para predecir FPS.
+
+Con MSAA, la memoria de muestras locales crece. Una tesela 32 × 32 con cuatro muestras RGBA8 y profundidad de 32 bits podría requerir 32 KiB solo para esos dos buffers, antes de otros estados. El tamaño de tesela óptimo depende de memoria local, paralelismo, formatos y número de muestras.
+
+* 7. La relación con OpenGL ES, Vulkan y Metal
+** 7.1. Los render passes son contratos de memoria
+Las API modernas permiten indicar si el contenido inicial de un attachment debe cargarse, limpiarse o descartarse, y si el resultado final necesita almacenarse. Esto importa especialmente en una GPU por teselas: cargar un attachment obliga potencialmente a traer datos desde memoria externa; almacenarlo obliga a exportar el resultado local.
+
+En Vulkan clásico, VkAttachmentDescription contiene loadOp, storeOp y operaciones independientes de stencil. Por ejemplo, un buffer de profundidad temporal que no se necesita después del render pass puede usar storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE. La API no promete una cantidad exacta de bytes ahorrados, pero ofrece al driver libertad para evitar el almacenamiento.
+
+#+begin_src cpp
+VkAttachmentDescription depth{};
+depth.format = depth_format;
+depth.samples = VK_SAMPLE_COUNT_1_BIT;
+depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+#+end_src
+
+El fragmento anterior es ilustrativo: hay que elegir un formato compatible, construir las referencias de subpass, las dependencias y el resto de estructuras. En Vulkan con dynamic rendering, la misma intención se expresa mediante los campos de carga y almacenamiento de los attachments dinámicos.
+
+** 7.2. OpenGL ES y descarte
+En OpenGL ES 3, glInvalidateFramebuffer permite señalar que ciertas regiones o attachments no necesitan conservarse. En arquitecturas por teselas esto puede evitar escrituras de profundidad o stencil a memoria principal.
+
+#+begin_src c
+const GLenum attachments[] = {
+    GL_DEPTH_ATTACHMENT,
+    GL_STENCIL_ATTACHMENT
+};
+glInvalidateFramebuffer(GL_FRAMEBUFFER, 2, attachments);
+#+end_src
+
+La llamada solo tiene sentido si los attachments existen y ya no se utilizará su contenido. No debe aplicarse indiscriminadamente al color que luego se presentará o muestreará.
+
+** 7.3. Metal
+En Metal, MTLRenderPassAttachmentDescriptor expone loadAction y storeAction. Para un depth attachment temporal, MTLLoadActionClear y MTLStoreActionDontCare expresan la misma intención general. No son una orden de ejecutar un algoritmo PowerVR específico: el driver y el hardware conservan libertad de implementación.
+
+* 8. Tile memory no es lo mismo que framebuffer fetch
+Un error frecuente consiste en asumir que, porque dos subpasses usan la misma tesela, siempre comparten datos sin pasar por memoria externa. La conservación depende de formatos, dependencias, uso de input attachments, compatibilidad, tamaño de almacenamiento local y decisiones del driver.
+
+Un pipeline de postprocesado que termina un render pass, lee el color como textura y escribe otro framebuffer puede provocar almacenamiento y recarga completos. Fusionar operaciones compatibles puede ahorrar ancho de banda, pero aumentar presión de memoria local o reducir paralelismo. Hay que medir.
+
+En motores con muchas luces, el /tiled deferred lighting/ divide la pantalla en grupos para construir listas de luces. Es un concepto relacionado en la organización espacial, pero no equivale a la eliminación de superficies ocultas por teselas del PowerVR2. Un motor puede usar listas de luces por tesela sobre una GPU inmediata.
+
+* 9. Límites y casos difíciles
+** 9.1. Transparencias
+La composición alfa depende del orden. El método «un ganador por píxel» es insuficiente. Se necesita ordenar, mantener varias capas o utilizar aproximaciones de transparencia independiente del orden, con costes de memoria y calidad propios.
+
+** 9.2. Alpha test y discard
+La cobertura de una hoja puede depender de una textura. Antes de consultar esa textura, el sistema no sabe qué píxeles son realmente opacos. Por eso los materiales con recorte pueden dificultar la eliminación temprana de superficies ocultas.
+
+** 9.3. Geometría muy pequeña o muy grande
+Miles de triángulos diminutos cargan el binning y la transformación. Triángulos enormes aparecen en numerosas listas. Las teselas reducen ciertos costes, no el trabajo geométrico en general.
+
+** 9.4. Lecturas y escrituras dependientes
+Efectos que leen el framebuffer mientras lo modifican, atomics o escrituras arbitrarias requieren semánticas precisas. No se puede reordenar cualquier operación sin alterar el resultado. Las API y arquitecturas modernas incorporan mecanismos para algunos de estos casos, con posibles pérdidas de rendimiento.
+
+** 9.5. Tile-based no implica siempre más rápido
+Una GPU inmediata de escritorio puede disponer de cachés grandes, compresión de color/profundidad y early-Z muy eficaz. El rendimiento depende de escena, shaders, texturas, overdraw, memoria y sincronización. Comparar solo el nombre de la arquitectura no permite predecir qué GPU ganará.
+
+* 10. Experimento reproducible
+Implementa dos rutas software con los mismos triángulos y el mismo criterio de profundidad. La ruta A sombrea cada fragmento cubierto antes de probar Z; la ruta B escribe primero owner/depth y sombrea solo los ganadores. Cuenta (a) fragmentos cubiertos, (b) llamadas a shade, (c) referencias triángulo-tesela y (d) tiempo por etapa.
+
+Genera 200 rectángulos opacos superpuestos, con profundidades aleatorias, y repite con 2.000 triángulos pequeños dispersos. En la primera escena B debería reducir enormemente las llamadas al shader si el shader es caro; en la segunda puede dominar el coste de clasificación. Después sustituye shade por una función barata y comprueba cómo cambia el punto de equilibrio.
+
+Haz una tercera prueba con transparencias: una superficie roja con alfa 0,5 delante de una azul. Verás que el algoritmo owner único ya no produce la composición correcta. Esta prueba es importante porque demuestra una limitación conceptual, no un simple problema de optimización.
+
+Para que la comparación sea justa, ejecuta varias iteraciones, precalienta cachés, usa una compilación optimizada, fija resolución y registra tiempos separados de binning, visibilidad y shading. La ruta A es intencionadamente ingenua: añade después un early-Z software para medir cuánto se estrecha la diferencia.
+
+* 11. Conclusiones: una decisión de arquitectura que sobrevivió
+PowerVR2 demuestra que el problema de los gráficos no consiste únicamente en producir más fragmentos por segundo. También consiste en evitar producir los fragmentos que no aportan nada a la imagen final.
+
+El binning permite procesar regiones pequeñas en memoria rápida. La resolución previa de visibilidad evita texturizar muchas superficies ocultas. Juntas, ambas técnicas atacan dos costes distintos: ancho de banda de framebuffer y sombreado redundante.
+
+La contrapartida es real: hay que almacenar listas, diferir trabajo, reconstruir atributos y tratar de manera especial las transparencias y los efectos con dependencias. El equilibrio entre ambas arquitecturas ha evolucionado con las cachés, las técnicas de compresión, los shaders programables y las API explícitas.
+
+La lección práctica para quien programe hoy en Vulkan, Metal u OpenGL ES es concreta: entender cuándo un attachment necesita cargarse o almacenarse puede ser tan importante como optimizar unas instrucciones de shader. La lección histórica es aún más interesante: algunas de las decisiones que parecían extravagantes en una consola de 1998 anticipaban restricciones energéticas que dominarían décadas después los gráficos móviles.
+
+* Referencias y lecturas originales
+- Imagination Technologies, [[https://docs.imgtec.com/starter-guides/powervr-architecture/html/topics/tile-based-deferred-rendering-index.html][Tile-Based Deferred Rendering (TBDR)]]. Documentación oficial de la arquitectura.
+- Imagination Technologies, [[https://docs.imgtec.com/starter-guides/powervr-architecture/html/topics/per-tile-rasterization.html][Per-Tile Rasterization (Renderer)]]. Descripción oficial del ISP, tag buffer y TSP.
+- Imagination Technologies, [[https://blog.imaginationtech.com/sorting-objects-and-geometry-on-powervr-hardware/][Sorting Objects and Geometry on PowerVR Hardware]]. Recomendaciones sobre opacos, depth pre-pass y transparencia.
+- Arm, [[https://developer.arm.com/community/arm-community-blogs/b/mobile-graphics-and-gaming-blog/posts/the-mali-gpu-an-abstract-machine-part-2---tile-based-rendering][The Mali GPU: an abstract machine, part 2 — tile-based rendering]]. Explicación de costes de memoria y descartes.
+- Arm, [[https://www.arm.com/technologies/graphics-technologies/transaction-elimination][Transaction Elimination]]. Optimización de escritura de teselas sin cambios.
+- Khronos, [[https://docs.vulkan.org/refpages/latest/refpages/source/VkAttachmentDescription.html][VkAttachmentDescription]]. Contrato de carga y almacenamiento de attachments.
+- Khronos, [[https://registry.khronos.org/OpenGL-Refpages/es3.0/html/glInvalidateFramebuffer.xhtml][glInvalidateFramebuffer]]. Semántica de invalidación en OpenGL ES.
+- Apple, [[https://developer.apple.com/documentation/metal/mtlrenderpassattachmentdescriptor][MTLRenderPassAttachmentDescriptor]]. Load/store actions de Metal.
+- AnandTech (2000), [[https://www.anandtech.com/show/558/4][The PowerVR Approach: Tile Rendering]]. Fuente contemporánea sobre KYRO y el contexto competitivo.
+
+Las fórmulas de tráfico y el rasterizador didáctico son construcciones explicativas propias; no representan contadores medidos ni una reproducción exacta del silicio de Dreamcast.
