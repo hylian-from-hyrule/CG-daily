@@ -21,9 +21,13 @@
           (insert "#+LANGUAGE: es\n#+LATEX_CLASS: report\n#+LATEX_COMPILER: xelatex\n")
           (insert "#+OPTIONS: toc:2 num:t\n")
           (insert "#+LATEX_HEADER: \\usepackage[spanish]{babel}\n")
-          (insert "#+LATEX_HEADER: \\usepackage{fontspec}\n")
-          (insert "#+LATEX_HEADER: \\setmainfont{DejaVu Serif}\n")
-          (insert "#+LATEX_HEADER: \\setmonofont{DejaVu Sans Mono}\n\n")
+          (dolist (line (split-string
+                         (with-temp-buffer
+                           (insert-file-contents "scripts/monthly-style.tex")
+                           (buffer-string)) "\n" t))
+            (unless (string-prefix-p "%" line)
+              (insert "#+LATEX_HEADER: " line "\n")))
+          (insert "\n")
           (dolist (f sources)
             (with-temp-buffer
               (insert-file-contents f)
