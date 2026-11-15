@@ -1,0 +1,386 @@
+#+TITLE: Transform & Lighting: cómo GeForce 256 trasladó la geometría de la CPU a la GPU
+#+DATE: <2026-11-15 Sun>
+#+LANGUAGE: es
+#+FILETAGS: :historia:gpu:apis:iluminacion:
+#+OPTIONS: toc:2 num:t
+
+* Introducción: una aceleradora 3D que todavía necesitaba la CPU
+
+En 1998, instalar una tarjeta aceleradora 3D no significaba necesariamente que la tarjeta calculase la geometría de un mundo tridimensional. Muchos aceleradores de consumo destacaban al dibujar triángulos, interpolar coordenadas de textura, efectuar pruebas de profundidad y combinar colores, pero la CPU seguía preparando gran parte de los vértices. El programador calculaba la posición de los objetos respecto a la cámara, proyectaba coordenadas y, en numerosos motores, evaluaba la iluminación de los vértices antes de entregar triángulos a la API.
+
+En agosto y septiembre de 1999, la presentación de GeForce 256 popularizó una expresión que acabaría siendo familiar en las especificaciones de tarjetas gráficas: /hardware Transform & Lighting/, o T&L. La novedad no fue inventar la transformación de vértices ni la iluminación, ni siquiera realizar ambas en hardware: las estaciones gráficas profesionales llevaban años empleando aceleración geométrica. Lo relevante fue integrar estas etapas en un procesador gráfico de consumo junto a las unidades de rasterización. La crónica contemporánea de Hardware.fr, fechada el 31 de agosto de 1999, es especialmente útil para distinguir la novedad comercial de sus antecedentes.
+
+La pregunta técnica es más interesante que el eslogan: ¿qué operaciones realizaba realmente ese hardware, qué datos entraban y salían, qué ganaba el motor al delegarlas y por qué el modelo de iluminación de entonces era tan distinto al de un renderizador actual?
+
+* El problema: de un modelo local a píxeles en pantalla
+
+** Los espacios de coordenadas
+
+Supongamos un vértice de una rueda almacenado en coordenadas locales: p=(1,0,0). Para dibujarlo necesitamos conocer la posición del coche en el mundo, la posición de la cámara y la proyección. En coordenadas homogéneas, escribimos:
+
+\[
+p_{\mathrm{clip}}=P\,V\,M\,\begin{pmatrix}x\\y\\z\\1\end{pmatrix}.
+\]
+
+M transforma de espacio de objeto a mundo; V, de mundo a cámara; P, de cámara a espacio de recorte. Después se recorta la primitiva contra el volumen visible, se divide por w y se aplica la transformación de viewport. El orden escrito presupone vectores columna: otras APIs y bibliotecas usan convenciones distintas. Mezclarlas es una fuente clásica de errores.
+
+La división por w produce las coordenadas normalizadas:
+
+\[
+x_{\mathrm{ndc}}=x_c/w_c,\qquad
+y_{\mathrm{ndc}}=y_c/w_c,\qquad
+z_{\mathrm{ndc}}=z_c/w_c.
+\]
+
+La proyección en perspectiva es precisamente la razón por la que el tamaño aparente de un objeto decrece con la distancia. Una transformación de modelo o vista es afín; la división homogénea de la proyección no lo es.
+
+** El coste por vértice
+
+Una matriz 4x4 multiplicada por un vector de cuatro componentes requiere, en una implementación escalar directa, 16 multiplicaciones y 12 sumas. Si encadenamos matrices previamente, podemos calcular una sola matriz MVP por objeto y aplicarla a cada vértice, evitando tres multiplicaciones de matriz por vértice.
+
+Para una malla de 20.000 vértices, una transformación de 4x4 supone unas 320.000 multiplicaciones y 240.000 sumas antes de incluir normales, iluminación, clipping o el propio dibujo. No son cifras extraordinarias para una CPU moderna; sí ayudan a entender por qué eran significativas en procesadores y motores de finales de los noventa, especialmente cuando varios objetos dinámicos debían actualizarse a 30 o 60 imágenes por segundo.
+
+El coste real dependía del formato de vértices, la reutilización mediante índices, el número de luces y el trabajo de la CPU fuera del renderizado. No es correcto deducir una mejora de rendimiento fija a partir del recuento de operaciones: mover trabajo a la GPU también introduce costes de transferencia, cambios de estado y posibles cuellos de botella en otras etapas.
+
+* La mitad menos visible: transformar correctamente las normales
+
+** Por qué una normal no es una posición
+
+Una normal describe la orientación de una superficie. Debe permanecer perpendicular a sus tangentes después de transformar la geometría. Si aplicamos únicamente rotaciones, transformar la normal mediante la misma rotación funciona. Con escalas no uniformes, deja de ser cierto.
+
+Sea t una tangente y n una normal, con n^T t=0. Si una transformación lineal A convierte la tangente en t'=At, buscamos una normal n' que satisfaga:
+
+\[
+(n')^T At=0.
+\]
+
+Una solución proporcional es:
+
+\[
+n'=(A^{-1})^T n,
+\]
+
+porque entonces \((n')^T At=n^T A^{-1}At=n^Tt=0\). Esta es la /matriz normal/, calculada sobre la parte lineal 3x3 de la transformación correspondiente. Finalmente se normaliza el vector.
+
+La distinción importa mucho cuando un objeto tiene escala distinta en X, Y y Z. Una esfera estirada hasta parecer un elipsoide no puede conservar las mismas normales si esperamos reflejos e iluminación coherentes.
+
+** Un ejemplo numérico
+
+Tomemos una tangente t=(1,1,0) y una normal n=(1,-1,0), ortogonales entre sí. Escalamos X por 2 e Y por 1. La tangente pasa a t'=(2,1,0). Transformar incorrectamente la normal con A produce (2,-1,0), cuyo producto escalar con t' es 3: ya no son perpendiculares. Aplicando la inversa transpuesta obtenemos (0.5,-1,0); ahora el producto escalar es 1-1=0.
+
+En OpenGL clásico existía GL_NORMALIZE para pedir la normalización posterior de las normales transformadas. Normalizar no sustituye a utilizar una transformación geométricamente correcta: resuelve la longitud, no cualquier error de orientación.
+
+* Iluminación por vértice: el modelo que podía fijarse en silicio
+
+** Luz ambiental, difusa y especular
+
+El pipeline fijo de aquella época usaba una familia de modelos empíricos inspirados en Lambert y Phong. No describían el transporte físico completo de la luz; ofrecían una aproximación económica y predecible.
+
+Para una luz direccional, con normal unitaria N y dirección unitaria L hacia la luz, la componente difusa de Lambert es:
+
+\[
+C_d=k_d\,I_d\,\max(0,N\cdot L).
+\]
+
+Cuando N y L apuntan en la misma dirección, el producto escalar vale 1; si son perpendiculares, vale 0. La intensidad se reduce gradualmente con el ángulo. En el pipeline clásico se añadía un término ambiental constante, que evitaba que las superficies no iluminadas quedasen completamente negras:
+
+\[
+C_a=k_a I_a.
+\]
+
+Para el brillo especular, una forma habitual del modelo de Phong utiliza la reflexión R de la dirección incidente y la dirección V hacia el observador:
+
+\[
+C_s=k_s I_s \max(0,R\cdot V)^{s}.
+\]
+
+El exponente s controla la concentración del brillo. El modelo de Blinn-Phong sustituye R por el vector medio H=normalize(L+V) y utiliza \((N\cdot H)^s\). Las variantes exactas y sus parámetros difieren entre APIs; no debe suponerse que dos motores con el mismo exponente produzcan necesariamente el mismo resultado.
+
+** ¿Qué sucede con una luz puntual?
+
+La dirección L depende de la posición del vértice: L=normalize(P_l-P_v). También se introducía una atenuación dependiente de la distancia d, frecuentemente:
+
+\[
+f(d)=\frac{1}{a_0+a_1d+a_2d^2}.
+\]
+
+Esta expresión es una herramienta artística y de compatibilidad histórica, no una solución completa de iluminación físicamente basada. Los coeficientes requieren atención: si el denominador se acerca a cero, el resultado se dispara. En un motor real se valida la configuración y se limita la intensidad cuando procede.
+
+Para focos se añadía un factor angular, a menudo una potencia del coseno dentro de un cono. Así, cada luz añadía productos escalares, normalizaciones y potencias. El coste crecía con el número de vértices iluminados y de luces activas, y por ello las APIs de función fija exponían límites y capacidades de iluminación.
+
+** Gouraud: interpolar el resultado, no iluminar cada píxel
+
+En la iluminación por vértice se calcula un color en cada extremo del triángulo y después el rasterizador lo interpola. Para coordenadas baricéntricas \(\lambda_0,\lambda_1,\lambda_2\), con suma igual a 1, el color interpolado puede escribirse:
+
+\[
+C=\lambda_0 C_0+\lambda_1 C_1+\lambda_2 C_2.
+\]
+
+La interpolación de atributos en perspectiva requiere las correcciones correspondientes cuando el atributo se define en el espacio proyectivo; aquí la fórmula representa el principio de mezcla.
+
+Una consecuencia importante: un brillo especular estrecho situado en el centro de un triángulo grande puede desaparecer si ninguno de los tres vértices cae dentro del brillo. El hardware puede iluminar correctamente cada vértice y aun así producir una imagen pobre. La densidad de la malla se convierte en un parámetro de calidad de iluminación.
+
+* Implementación didáctica en C++: un pequeño T&L software
+
+El siguiente código implementa la parte esencial de una luz direccional sobre vértices. Se asume que las posiciones ya se han llevado al espacio de vista, que las normales están transformadas con la matriz inversa transpuesta y normalizadas, y que la luz está expresada en el mismo espacio. Estas precondiciones evitan esconder errores de coordenadas bajo una función aparentemente sencilla.
+
+#+begin_src cpp
+#include <algorithm>
+#include <array>
+#include <cmath>
+
+struct Vec3 { float x, y, z; };
+
+float dot(Vec3 a, Vec3 b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+Vec3 operator*(Vec3 a, float s) {
+    return {a.x*s, a.y*s, a.z*s};
+}
+Vec3 operator+(Vec3 a, Vec3 b) {
+    return {a.x+b.x, a.y+b.y, a.z+b.z};
+}
+Vec3 normalize(Vec3 v) {
+    float len2 = dot(v, v);
+    if (len2 <= 1e-12f) return {0, 0, 1};
+    return v * (1.0f / std::sqrt(len2));
+}
+Vec3 hadamard(Vec3 a, Vec3 b) {
+    return {a.x*b.x, a.y*b.y, a.z*b.z};
+}
+Vec3 saturate(Vec3 v) {
+    return {std::clamp(v.x, 0.f, 1.f),
+            std::clamp(v.y, 0.f, 1.f),
+            std::clamp(v.z, 0.f, 1.f)};
+}
+struct Material {
+    Vec3 ambient, diffuse, specular;
+    float shininess;
+};
+struct DirectionalLight {
+    Vec3 toward_light;
+    Vec3 ambient, diffuse, specular;
+};
+
+Vec3 shade_vertex(Vec3 normal, Vec3 toward_eye,
+                  const Material& m,
+                  const DirectionalLight& light) {
+    Vec3 n = normalize(normal);
+    Vec3 l = normalize(light.toward_light);
+    Vec3 v = normalize(toward_eye);
+    Vec3 h = normalize(l + v);
+
+    float ndotl = std::max(0.f, dot(n, l));
+    float spec = ndotl > 0.f
+        ? std::pow(std::max(0.f, dot(n, h)), m.shininess)
+        : 0.f;
+
+    Vec3 a = hadamard(m.ambient, light.ambient);
+    Vec3 d = hadamard(m.diffuse, light.diffuse) * ndotl;
+    Vec3 s = hadamard(m.specular, light.specular) * spec;
+    return saturate(a + d + s);
+}
+#+end_src
+
+Este ejemplo no pretende reproducir bit a bit el comportamiento de OpenGL o Direct3D antiguos: cada API define convenciones y combinaciones de materiales particulares. Tampoco incluye transformación de normales, atenuación, gamma, múltiples luces ni tratamiento físico de la energía. Sirve para aislar el trabajo matemático que se repetía por vértice.
+
+Un experimento útil consiste en dibujar una esfera con 12, 24 y 96 segmentos, manteniendo la luz especular estrecha. La forma aparente del brillo cambia con la densidad de la malla aunque la superficie ideal representada sea la misma. Si se ilumina por fragmento, el resultado deja de depender tan directamente de que haya un vértice justo bajo el reflejo.
+
+* OpenGL de función fija: estado en vez de shaders
+
+** Una API diseñada para configurar una máquina
+
+En OpenGL 1.x, el programador no entregaba un programa de vértices GLSL. Activaba capacidades, configuraba luces y materiales y dejaba que la implementación ejecutase el pipeline especificado. Una escena podía definir matrices de modelo-vista y proyección, enviar normales y posiciones, y habilitar la iluminación.
+
+#+begin_src c
+/* OpenGL de compatibilidad: no funciona en un core profile moderno. */
+GLfloat direction[] = {0.0f, 0.0f, 1.0f, 0.0f};
+GLfloat diffuse[]   = {0.9f, 0.85f, 0.75f, 1.0f};
+GLfloat ambient[]   = {0.1f, 0.1f, 0.1f, 1.0f};
+
+glMatrixMode(GL_MODELVIEW);
+/* Cargar aquí la matriz de vista apropiada.
+   GL_POSITION se transforma por el model-view vigente. */
+glLightfv(GL_LIGHT0, GL_POSITION, direction);
+glLightfv(GL_LIGHT0, GL_DIFFUSE, diffuse);
+glLightfv(GL_LIGHT0, GL_AMBIENT, ambient);
+
+glEnable(GL_LIGHTING);
+glEnable(GL_LIGHT0);
+glEnable(GL_NORMALIZE);
+glShadeModel(GL_SMOOTH);
+
+/* Al enviar geometría, cada vértice debe tener su normal. */
+glBegin(GL_TRIANGLES);
+glNormal3f(0.0f, 0.0f, 1.0f);
+glVertex3f(-1.0f, -1.0f, 0.0f);
+glNormal3f(0.0f, 0.0f, 1.0f);
+glVertex3f( 1.0f, -1.0f, 0.0f);
+glNormal3f(0.0f, 0.0f, 1.0f);
+glVertex3f( 0.0f,  1.0f, 0.0f);
+glEnd();
+#+end_src
+
+El cuarto componente de GL_POSITION distingue luz direccional (w=0) de luz posicional (w distinto de cero). Un detalle que provoca errores al recuperar código antiguo es que glLightfv transforma la posición o dirección usando la matriz de modelo-vista vigente en el momento de llamar a la función; no conserva simplemente las coordenadas tal como se escribieron. Si se cambia la cámara y no se actualiza la luz adecuadamente, parece que la iluminación se mueve con los objetos.
+
+El modo GL_SMOOTH pide interpolación de colores entre vértices, mientras que GL_FLAT selecciona un color representativo para la primitiva. No debe confundirse con antialiasing, filtrado de texturas ni sombreado por fragmento.
+
+** Ventajas y desventajas del estado global
+
+La ventaja era una interfaz compacta y relativamente uniforme. La aplicación describía el resultado deseado sin programar cada etapa. El inconveniente era la gran cantidad de estado implícito: el orden de las llamadas podía modificar el significado de las siguientes. Un cambio de matriz, material o luz fuera de lugar generaba errores visuales difíciles de localizar.
+
+Además, el pipeline fijo obligaba a adaptar los efectos a un conjunto limitado de operaciones. No era sencillo introducir una BRDF nueva, una iluminación estilizada particular o una deformación de vértices arbitraria. La llegada de shaders programables no solo incrementó potencia: cambió la unidad básica de expresión del renderizador, de configurar parámetros a escribir programas.
+
+* Direct3D 7 y 9: hardware, software y formatos de vértices
+
+** El concepto de Flexible Vertex Format
+
+Direct3D describía los datos de entrada mediante formatos de vértice. Por ejemplo, un vértice con posición XYZ, normal y un par de coordenadas de textura puede expresarse con D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1. Esta descripción no equivale a un shader: indica al pipeline fijo qué campos existen y cómo interpretarlos.
+
+En Direct3D 9, aunque ya existían shaders, todavía se conservaba el camino de función fija. Para utilizarlo se podía desactivar el vertex shader programable, configurar FVF, matrices, materiales y luces, y activar el estado de iluminación:
+
+#+begin_src cpp
+// Direct3D 9; se omiten creación del dispositivo y manejo de HRESULT.
+struct Vertex {
+    float x, y, z;
+    float nx, ny, nz;
+    float u, v;
+};
+constexpr DWORD FVF =
+    D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1;
+
+device->SetVertexShader(nullptr);
+device->SetFVF(FVF);
+device->SetRenderState(D3DRS_LIGHTING, TRUE);
+device->SetRenderState(D3DRS_NORMALIZENORMALS, TRUE);
+device->SetRenderState(D3DRS_SPECULARENABLE, TRUE);
+
+D3DLIGHT9 light = {};
+light.Type = D3DLIGHT_DIRECTIONAL;
+light.Direction = D3DXVECTOR3(0.0f, -1.0f, 0.0f);
+light.Diffuse = D3DXCOLOR(1.f, 0.95f, 0.85f, 1.f);
+light.Ambient = D3DXCOLOR(0.1f, 0.1f, 0.1f, 1.f);
+light.Specular = D3DXCOLOR(1.f, 1.f, 1.f, 1.f);
+device->SetLight(0, &light);
+device->LightEnable(0, TRUE);
+#+end_src
+
+El ejemplo usa D3DX, biblioteca auxiliar histórica que no forma parte del núcleo de Direct3D 9 y puede no estar disponible en un entorno moderno. En una reconstrucción contemporánea se pueden rellenar las estructuras directamente sin depender de D3DX. Además hay que configurar correctamente las matrices WORLD, VIEW y PROJECTION, el material y la geometría antes de dibujar.
+
+** Hardware vertex processing frente a software vertex processing
+
+Direct3D 9 permitía crear dispositivos con D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_SOFTWARE_VERTEXPROCESSING o D3DCREATE_MIXED_VERTEXPROCESSING. No eran sinónimos de usar o no usar una GPU para dibujar: indicaban dónde se procesaban los vértices. En modo mixto se podía alternar, bajo las restricciones documentadas.
+
+Esto aclara una confusión habitual: que una tarjeta acelere triángulos no significa que disponga de T&L dedicado. Una aplicación podía transformar e iluminar vértices en la CPU y seguir enviando triángulos a una GPU para rasterizarlos. Las API separaban conceptualmente las etapas precisamente porque las capacidades del hardware variaban.
+
+Microsoft documenta también ProcessVertices, que permite ejecutar procesamiento de vértices y guardar el resultado en otro buffer. Es una pista sobre la naturaleza del pipeline: el resultado de T&L son datos de vértice transformados e iluminados, no una imagen terminada.
+
+* Por qué 1999 fue un punto de inflexión, y por qué no lo cambió todo
+
+** Un pipeline de dos ritmos
+
+Podemos imaginar una GPU con dos grandes tipos de trabajo: geometría por vértice y rasterización por fragmento. Si una escena contiene muchos triángulos diminutos, la etapa geométrica puede dominar; si tiene pocos triángulos enormes y varias capas de texturas, el coste de fragmentos y memoria puede dominar.
+
+Una aproximación pedagógica del tiempo de cuadro es:
+
+\[
+T_{\mathrm{frame}}\approx
+\max(T_{\mathrm{vertices}},T_{\mathrm{fragments}},
+T_{\mathrm{memory}},T_{\mathrm{CPU}}),
+\]
+
+si las etapas se solapan suficientemente. No es un modelo de rendimiento exacto, pero explica por qué acelerar vértices no garantiza multiplicar los FPS. La etapa más lenta establece el ritmo.
+
+En un motor que ya estuviese limitado por fill rate, añadir T&L podría aportar poco. En uno con gran cantidad de geometría dinámica, liberar ciclos de CPU podía permitir más objetos, animación, física o lógica. Los beneficios dependían también de cómo se preparaban y reutilizaban los datos.
+
+** Transformar una vez, dibujar muchas
+
+El uso de índices permite compartir vértices entre triángulos, pero la reutilización efectiva depende de las cachés y de la organización de la malla. Si una malla contiene 10.000 triángulos, no implica necesariamente 30.000 transformaciones diferentes. La reutilización de vértices puede reducir significativamente ese trabajo.
+
+La transición a buffers de vértices residentes y formatos adecuados acompañó la evolución de T&L. Enviar vértices individualmente mediante llamadas inmediatas era sencillo, pero el coste de llamadas y de transferencias podía ocultar las ganancias de una unidad geométrica rápida.
+
+** La CPU no desapareció del pipeline
+
+La CPU seguía realizando visibilidad a nivel de objetos, gestión de recursos, animación según el motor, preparación de comandos y multitud de tareas. Tampoco todo T&L de la época podía deformar mallas de cualquier manera. La animación esquelética, los morph targets y los efectos procedurales complejos requerían soluciones específicas, procesamiento previo o, posteriormente, vertex shaders.
+
+El término GPU, popularizado comercialmente por NVIDIA en 1999, no implica que antes no existieran procesadores gráficos sofisticados. Es más preciso hablar de una etapa de integración de funciones geométricas en el mercado de consumo que de la aparición súbita de todo el procesamiento gráfico.
+
+* De la función fija al vertex shader
+
+** La misma matemática, otra interfaz
+
+Un vertex shader moderno puede implementar el núcleo de aquellas transformaciones explícitamente. En GLSL, un ejemplo sencillo:
+
+#+begin_src glsl
+#version 330 core
+layout(location = 0) in vec3 inPosition;
+layout(location = 1) in vec3 inNormal;
+
+uniform mat4 modelViewProjection;
+uniform mat3 normalMatrix;
+uniform vec3 lightToward; // mismo espacio que la normal
+out vec3 vertexLight;
+
+void main() {
+    gl_Position = modelViewProjection * vec4(inPosition, 1.0);
+    vec3 n = normalize(normalMatrix * inNormal);
+    vec3 l = normalize(lightToward);
+    float diffuse = max(dot(n, l), 0.0);
+    vertexLight = vec3(0.08) + vec3(0.92) * diffuse;
+}
+#+end_src
+
+En este ejemplo, normalMatrix debe transformar las normales al espacio donde está lightToward. Si se usa modelViewProjection para la posición, ello no determina automáticamente el espacio correcto para la iluminación: hay que decidirlo explícitamente. El fragment shader podría interpolar vertexLight y multiplicarlo por el albedo.
+
+Para iluminación por fragmento, en cambio, se transmitirían normal y posición apropiadas y se evaluaría la iluminación después de rasterizar. La diferencia es conceptual y económica: el coste de iluminación pasa de depender fundamentalmente de vértices a depender de fragmentos cubiertos. A cambio, aparecen reflejos y gradientes que no quedan restringidos a las esquinas de los triángulos.
+
+** ¿Por qué todavía importan los vértices?
+
+Incluso en pipelines modernos, los vértices se transforman, se recortan y generan primitivas. Los mesh shaders y otras formas de procesar geometría cambian cómo se organiza y alimenta el trabajo, pero no eliminan la necesidad de pasar de una representación geométrica a una cobertura de píxeles.
+
+Además, hay motivos para seguir calculando ciertos datos por vértice: son relativamente baratos, pueden interpolarse y pueden bastar para objetos pequeños o efectos estilizados. La decisión no es dogmática; depende del tamaño proyectado, la frecuencia espacial del efecto y el presupuesto de GPU.
+
+* Comparación de tres generaciones
+
+| Etapa | Preparación de geometría | Iluminación | Flexibilidad |
+|-------+--------------------------+-------------+--------------|
+| Aceleración 3D temprana de consumo | Frecuentemente CPU | CPU o colores precomputados | Control del motor, coste CPU |
+| T&L fijo de consumo | Unidad geométrica de GPU cuando disponible | Modelo de luces y materiales de API | Limitada por estados y capacidades |
+| Pipeline programable | Vertex shaders y otras etapas programables | Por vértice, fragmento o cómputo | Amplia, con responsabilidad del desarrollador |
+
+La tabla simplifica un panorama heterogéneo. Hubo hardware profesional con geometría acelerada mucho antes de 1999, chips de consumo con capacidades distintas y motores híbridos. También hubo APIs y tarjetas que ofrecían partes de estas funciones sin ajustarse a una división cronológica estricta.
+
+* Experimentos recomendados para un renderizador propio
+
+** Medir el coste sin confundir etapas
+
+Crea una escena con un conjunto fijo de triángulos indexados y una luz direccional. Compara tres configuraciones: (1) transformación e iluminación por vértice en CPU, (2) transformación en GPU e iluminación por vértice y (3) iluminación por fragmento. Mantén constantes resolución, malla, número de luces y materiales.
+
+Mide por separado tiempo de CPU, tiempo de GPU y número de vértices y fragmentos procesados. En OpenGL o Vulkan actuales, evita interpretar una medida de reloj alrededor de una llamada de dibujo como duración real de la GPU: el envío es asíncrono. Utiliza consultas temporales de GPU o herramientas de perfilado y repite mediciones para reducir ruido.
+
+Varía dos parámetros de forma independiente: número de triángulos y superficie cubierta en pantalla. Una malla más densa que ocupe el mismo número de píxeles incrementa trabajo geométrico; una malla pequeña que se acerque a la cámara puede incrementar fragmentos sin cambiar el número de vértices.
+
+** Buscar errores visuales deliberadamente
+
+Introduce una escala no uniforme en un objeto y compara normales transformadas con A frente a la inversa transpuesta. Mueve una luz especular estrecha sobre un triángulo grande y observa cómo puede desaparecer el brillo en Gouraud. Finalmente subdivide el triángulo: verás una mejora sin haber cambiado el modelo de luz.
+
+Estos experimentos separan tres problemas que suelen mezclarse: geometría, modelo de iluminación y frecuencia de evaluación. Comprender la separación ayuda tanto a leer código antiguo como a depurar shaders modernos.
+
+* Limitaciones y conclusiones
+
+T&L de función fija resolvía una parte concreta de la cadena gráfica: transformar vértices y calcular colores de iluminación con operaciones predefinidas. No resolvía automáticamente la visibilidad de objetos, las sombras, las reflexiones físicas, la animación arbitraria ni el coste de dibujar píxeles. Tampoco era una innovación matemática radical: su importancia fue arquitectónica y económica, al trasladar trabajo repetitivo a hardware dedicado y hacerlo accesible a motores de consumo.
+
+Su legado está en la separación de responsabilidades que todavía encontramos al estudiar el pipeline. Un vértice pasa por espacios de coordenadas; su normal necesita una transformación distinta; una luz se evalúa en un espacio coherente; la rasterización interpola atributos; y la decisión de iluminar por vértice o por fragmento afecta simultáneamente a rendimiento y calidad.
+
+La GeForce 256 es, por tanto, una buena puerta de entrada a una pregunta más general de ingeniería: ¿qué operaciones conviene fijar en hardware y cuáles deben permanecer programables? La historia posterior de las GPU —vertex shaders, fragment shaders, cómputo general y pipelines cada vez más flexibles— puede leerse como una serie de respuestas diferentes a esa misma pregunta.
+
+* Referencias originales y documentación
+
+- Marc Prieur, /Preview: nVidia GeForce 256/, Hardware.fr, 31 de agosto de 1999; análisis contemporáneo de T&L y su contexto: [[https://www.hardware.fr/articles/53-3/transformation-lighting-bases.html][Transform & Lighting: les bases]].
+- Andy Patrizio, /May the GeForce Be With You/, Wired, 2 de septiembre de 1999; noticia contemporánea del anuncio: [[https://www.wired.com/1999/09/may-the-geforce-be-with-you/][Wired, 1999]].
+- Microsoft, /Fixed Function Vertex Processing (Direct3D 9)/; descripción de ProcessVertices y formatos de salida: [[https://learn.microsoft.com/en-us/windows/win32/direct3d9/fixed-function-vertex-processing][Microsoft Learn]].
+- Microsoft, /Processing Vertex Data (Direct3D 9)/; selección de procesamiento software, hardware y mixto: [[https://learn.microsoft.com/en-us/windows/win32/direct3d9/processing-vertex-data][Microsoft Learn]].
+- Microsoft, /Lighting State (Direct3D 9)/; requisitos de normales e iluminación: [[https://learn.microsoft.com/en-us/windows/win32/direct3d9/lighting-state][Microsoft Learn]].
+- Microsoft, /Setting Render States with Fixed-Function and Programmable Shader Pipeline/; estados específicos de función fija: [[https://learn.microsoft.com/en-us/windows/win32/direct3d9/setting-render-states-with-fixed-function-and-programmable-shader-pipeline][Microsoft Learn]].
+- David J. Eck, /Introduction to Computer Graphics/, sección OpenGL 1.1 Light and Material; explicación y ejemplos de la API histórica: [[https://math.hws.edu/graphicsbook/c4/s2.html][OpenGL 1.1: Light and Material]].
+- Jon Peddie, /Famous Graphics Chips: NVIDIA's GeForce 256/, IEEE Computer Society, 25 de febrero de 2021; retrospectiva histórica y precisión sobre el término GPU: [[https://www.computer.org/publications/tech-news/chasing-pixels/nvidias-geforce-256][IEEE Computer Society]].
