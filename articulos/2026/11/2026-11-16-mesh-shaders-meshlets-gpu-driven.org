@@ -1,0 +1,461 @@
+#+TITLE: Mesh shaders y meshlets: de los triángulos indexados al renderizado dirigido por la GPU
+#+DATE: <2026-11-16 Mon>
+#+LANGUAGE: es
+#+FILETAGS: :moderno:gpu:mesh-shaders:vulkan:directx12:
+#+OPTIONS: toc:2 num:t
+
+* Introducción: un cuello de botella que no estaba en los píxeles
+
+Durante los años noventa, el trabajo geométrico pasó gradualmente de la CPU a los aceleradores gráficos. El capítulo anterior sobre Transform & Lighting describía un hito de esa transición: transformar vértices e iluminarlos sin consumir tantos ciclos de CPU. Sin embargo, trasladar una operación a la GPU no elimina automáticamente la necesidad de organizarla. A medida que aumentó la complejidad de las escenas, la pregunta dejó de ser solamente «¿cuántos triángulos por segundo puedo rasterizar?» y pasó a ser «¿cuántos triángulos innecesarios puedo evitar preparar?».
+
+En la canalización clásica de Direct3D y OpenGL, la aplicación entrega índices y vértices, y el hardware de entrada de ensamblado (=Input Assembler=) los distribuye al vertex shader. El sistema resulta eficiente para geometría convencional, pero impone un orden conceptual: primero se presentan vértices, después se ensamblan primitivas, y más adelante se descartan aquellas que no deben aparecer. El motor puede efectuar *culling* de objetos completos antes del dibujo; aun así, una malla parcialmente visible puede arrastrar mucho trabajo geométrico inútil.
+
+Los *mesh shaders*, introducidos en hardware de consumo con la generación Turing de NVIDIA en 2018 y formalizados posteriormente en DirectX 12 Ultimate y en =VK_EXT_mesh_shader=, proponen otra organización. Un grupo de hilos programable genera conjuntamente un pequeño conjunto de vértices y primitivas. Antes de hacerlo, una etapa opcional puede decidir cuántos grupos merece la pena ejecutar. La unidad fundamental de trabajo deja de ser únicamente el vértice individual y pasa a ser una pequeña porción de la malla: el *meshlet*.
+
+El objetivo de este artículo es comprender qué cambia realmente, cómo preparar los datos, qué matemáticas permiten descartar geometría y qué compromisos aparecen al implementarlo. No hay que confundir mesh shaders con ray tracing, ni con un mecanismo automático de aumento de detalle: siguen produciendo primitivas para el rasterizador convencional.
+
+* 1. La canalización tradicional y sus costes
+
+** 1.1. De un buffer de índices a la pantalla
+
+Una malla indexada contiene un array de atributos de vértice y otro de índices. Para un cuadrado compuesto por dos triángulos podemos almacenar cuatro posiciones y seis índices:
+
+#+begin_src cpp
+struct Vertex {
+    float position[3];
+    float normal[3];
+    float uv[2];
+};
+
+constexpr uint32_t indices[] = {
+    0, 1, 2,
+    2, 1, 3
+};
+#+end_src
+
+El vertex shader transforma cada vértice a espacio de clip. La GPU puede aprovechar una caché de vértices transformados cuando varios triángulos comparten índices. Después se realiza ensamblado de primitivas, recorte, división por =w=, rasterización y sombreado de fragmentos. Esta separación hizo posible diseñar hardware muy especializado y eficiente.
+
+El inconveniente no es que el modelo sea malo. Es que el programa controla poco la agrupación de triángulos dentro de la etapa geométrica. Si un modelo ocupa miles de triángulos y solo una pequeña región es visible, el motor puede elegir entre dibujarlo entero o implementar técnicas adicionales: dividirlo en submallas, preparar varios niveles de detalle, construir comandos indirectos o usar compute shaders para filtrar geometría.
+
+** 1.2. Draw calls y GPU-driven rendering no son sinónimos
+
+Un =draw call= implica trabajo de preparación, validación y envío de comandos, aunque su coste depende enormemente de la API, el controlador y el hardware. Las APIs explícitas redujeron parte de ese coste y permitieron generar comandos indirectos. Por ejemplo, con =vkCmdDrawIndexedIndirect= una GPU puede escribir los parámetros de varios dibujos en un buffer, evitando que la CPU decida cada uno.
+
+Eso ya es una forma de *GPU-driven rendering*. No requiere mesh shaders. La aportación de estos últimos es diferente: la propia etapa que emite triángulos se vuelve programable por grupos, sin depender de un ensamblador fijo de índices de entrada. Las dos técnicas pueden combinarse.
+
+** 1.3. Un ejemplo de trabajo desperdiciado
+
+Imaginemos un escenario con 20.000 objetos, cada uno de 5.000 triángulos. El total es de 100 millones de triángulos potenciales. Si descartamos 18.000 objetos mediante pruebas de frustum, todavía quedan 10 millones de triángulos pertenecientes a los 2.000 objetos admitidos. Pero quizá solo un tercio de su geometría es relevante por estar parcialmente fuera de cámara, de espaldas o tapada.
+
+No podemos concluir que un mesh shader vaya a triplicar el rendimiento: el cuello de botella podría ser el sombreado de píxeles, el ancho de banda o el coste del propio culling. El ejemplo solo muestra la diferencia entre *visibilidad del objeto* y *visibilidad de regiones de la malla*.
+
+* 2. Meshlets: una nueva granularidad geométrica
+
+** 2.1. Particionar la malla
+
+Un meshlet es un pequeño conjunto de triángulos y sus vértices únicos. Por ejemplo, un presupuesto de 64 vértices y 126 triángulos, recomendado para ciertos escenarios por NVIDIA en su introducción a Turing, permite que un grupo de hilos cargue una porción manejable de geometría.
+
+No se trata de una constante universal. Los límites efectivos dependen de la API, del dispositivo, del tamaño de los atributos y de los recursos de ejecución. En DirectX Mesh Shader Tier 1 existen máximos de 256 vértices y 256 primitivas por grupo, junto con límites de memoria de salida. Un meshlet de 64/126 es una decisión de ingeniería, no una obligación del estándar.
+
+El proceso de partición suele ejecutarse *offline*, al importar el modelo. Conviene reunir triángulos que compartan vértices y sean próximos espacialmente. Esto reduce duplicación, mejora localidad de memoria y hace que los volúmenes de culling sean más ajustados.
+
+** 2.2. Representación en memoria
+
+Una representación sencilla contiene tres bloques: metadatos de cada meshlet, una tabla de índices globales de vértices y una tabla de índices locales de triángulos.
+
+#+begin_src cpp
+#include <cstdint>
+#include <vector>
+
+struct Meshlet {
+    uint32_t vertex_offset;
+    uint32_t triangle_offset;
+    uint32_t vertex_count;
+    uint32_t triangle_count;
+    float sphere_center[3];
+    float sphere_radius;
+};
+
+struct MeshletData {
+    std::vector<Meshlet> meshlets;
+    std::vector<uint32_t> vertex_remap;
+    std::vector<uint8_t> local_triangles; // 3 bytes por triangulo
+};
+#+end_src
+
+Para reconstruir el vértice global de la esquina =k= de un triángulo:
+
+\[
+i_{\mathrm{local}} = T[m.triangle\_offset + 3t+k],
+\qquad
+i_{\mathrm{global}} = V[m.vertex\_offset+i_{\mathrm{local}}].
+\]
+
+Aquí =T= contiene índices locales de ocho bits, =V= la tabla de remapeo, =m= el meshlet y =t= el triángulo dentro de él. Esta doble indirección parece más compleja que un index buffer tradicional, pero permite que los índices de triángulo ocupen un byte si el meshlet tiene como máximo 256 vértices. El shader puede leer posiciones, normales y UV directamente desde buffers estructurados.
+
+Hay que cuidar el alineamiento y la decodificación: los índices locales compactados no tienen por qué corresponder a accesos eficientes en todas las GPU. En ocasiones se empaquetan varios índices en palabras de 32 bits para evitar lecturas no alineadas.
+
+** 2.3. Cómo construir un meshlet: algoritmo voraz
+
+Una primera implementación puede recorrer los triángulos y añadirlos al meshlet actual siempre que no se superen los límites. Al insertar un triángulo, contamos cuántos de sus tres vértices todavía no están presentes. Si no caben, cerramos el meshlet y comenzamos otro.
+
+#+begin_src cpp
+// Pseudocodigo C++: omite estructuras auxiliares y validaciones.
+for (Triangle tri : ordered_triangles) {
+    unsigned new_vertices = count_missing_vertices(current, tri);
+
+    if (current.triangles == max_triangles ||
+        current.vertices + new_vertices > max_vertices) {
+        finish_meshlet(current);
+        current = {};
+    }
+
+    append_triangle_with_local_indices(current, tri);
+}
+finish_if_nonempty(current);
+#+end_src
+
+El orden de entrada importa. Si agrupamos triángulos distantes, la esfera envolvente será enorme y el culling resultará poco útil. Una heurística mejor parte de un triángulo semilla y busca vecinos por adyacencia, favoreciendo la reutilización de vértices y la compacidad espacial. Las herramientas de optimización de mallas, como =meshoptimizer=, ofrecen algoritmos prácticos para esta tarea.
+
+** 2.4. Compacidad y reutilización: dos objetivos que compiten
+
+Supongamos dos particiones de una misma malla. La primera tiene menos vértices duplicados entre meshlets, pero sus grupos cubren regiones espaciales extensas. La segunda duplica algunos vértices en las fronteras, pero produce esferas pequeñas. La segunda podría ser mejor si permite descartar más grupos, aunque consuma más memoria.
+
+Podemos describir una función de coste aproximada:
+
+\[
+C = \alpha N_{\mathrm{vertices\ repetidos}}
+  + \beta \sum_m r_m^2
+  + \gamma N_{\mathrm{meshlets}},
+\]
+
+donde =r_m= es el radio de la esfera del meshlet y los pesos representan objetivos del motor. No es una fórmula estándar de la API, sino una manera de razonar sobre el equilibrio entre ancho de banda, eficacia del culling y sobrecarga por grupo.
+
+* 3. Culling de meshlets: matemáticas y precisión
+
+** 3.1. Frustum culling con esferas
+
+Cada meshlet puede almacenar una esfera de centro =c= y radio =r= que contenga todos sus vértices. Para un plano de cámara normalizado:
+
+\[
+n\cdot x+d=0,\qquad \|n\|=1,
+\]
+
+la distancia firmada del centro es =s=n·c+d=. Si:
+
+\[
+s < -r,
+\]
+
+la esfera está completamente fuera del semiespacio visible y el meshlet puede descartarse. Para un frustum convexo basta con que falle cualquiera de sus seis planos.
+
+#+begin_src cpp
+struct Vec3 { float x, y, z; };
+struct Plane { Vec3 n; float d; };
+struct Sphere { Vec3 c; float r; };
+
+float dot(Vec3 a, Vec3 b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+
+bool sphere_in_frustum(const Sphere& s, const Plane* planes) {
+    for (int i = 0; i < 6; ++i) {
+        if (dot(planes[i].n, s.c) + planes[i].d < -s.r)
+            return false;
+    }
+    return true;
+}
+#+end_src
+
+Esta función presupone planos normalizados y que esfera y planos están expresados en el mismo espacio de coordenadas. Con transformaciones no uniformes, un radio en espacio local no se puede trasladar ingenuamente a espacio mundo: hay que usar una cota conservadora del estiramiento lineal o transformar el volumen adecuadamente.
+
+** 3.2. Backface cone culling
+
+El rasterizador suele descartar triángulos cuya orientación proyectada apunta en sentido opuesto a la cámara. Pero, si todas las normales geométricas de un meshlet están concentradas alrededor de un eje, podemos intentar descartar el meshlet completo antes de transformar sus vértices.
+
+Sea =a= el eje unitario de un cono de normales, y =theta= su semiángulo máximo. Para una dirección de vista aproximadamente constante =v=, el ángulo entre =a= y =v= permite obtener una cota del ángulo de cualquier normal del meshlet con =v=. Si todas las normales apuntan inequívocamente en dirección de espaldas, se puede descartar el grupo.
+
+La dificultad es garantizar que la cota sea conservadora: perspectiva, tamaño del meshlet, orientación del objeto, winding y transformaciones pueden invalidar una prueba simplista. Para una cámara perspectiva cercana, la dirección hacia la cámara varía entre los puntos de un meshlet; usar solo el vector del centro puede dar falsos descartes. Las implementaciones robustas incorporan el volumen del meshlet y una prueba adaptada a la posición de cámara.
+
+El objetivo es *no descartar jamás geometría potencialmente visible*. Un falso positivo de visibilidad solo desperdicia rendimiento; un falso negativo introduce agujeros visibles.
+
+** 3.3. Oclusión: el problema más difícil
+
+El frustum culling detecta regiones fuera de cámara. El cone culling detecta orientaciones desfavorables. Ninguno sabe si un edificio oculta a otro. Para eso podemos consultar una pirámide jerárquica de profundidad, también llamada Hi-Z.
+
+La idea es construir niveles progresivamente más gruesos de la imagen de profundidad. Para un meshlet proyectamos una cota de su rectángulo en pantalla, elegimos un nivel apropiado y comparamos su profundidad más cercana con una profundidad conservadora del bloque. Si toda la región está inequívocamente detrás de geometría existente, podemos omitirla.
+
+El sentido de la comparación cambia con la convención de profundidad: en reversed-Z el valor cercano suele ser mayor, y las reducciones min/max deben ajustarse. Además, usar profundidad del fotograma anterior introduce problemas con objetos que se mueven o superficies recién descubiertas. Se necesitan márgenes, reproyección o fases de recuperación para evitar desapariciones incorrectas.
+
+** 3.4. Level of detail y tamaño proyectado
+
+Una esfera de radio =r= situada aproximadamente a distancia =z=, con proyección perspectiva y distancia focal en píxeles =f_px=, tiene un radio proyectado aproximado:
+
+\[
+r_{\mathrm{px}} \approx \frac{f_{\mathrm{px}}\,r}{z}.
+\]
+
+Si el detalle geométrico de un meshlet produce un error de superficie =epsilon= en unidades mundo, su error proyectado puede estimarse como:
+
+\[
+\epsilon_{\mathrm{px}}\approx\frac{f_{\mathrm{px}}\,\epsilon}{z}.
+\]
+
+Esto permite seleccionar un LOD en función de un umbral de error visual, no solo de la distancia. La aproximación supone que =z= es profundidad de cámara positiva y que el objeto es pequeño respecto a la distancia; cerca de cámara o para grandes extensiones hay que emplear cotas más cuidadosas.
+
+Un mesh shader no construye por sí mismo una jerarquía de LOD. El motor necesita preparar niveles o una estructura jerárquica y garantizar que no aparezcan grietas entre regiones de diferente resolución.
+
+* 4. Cómo funciona el pipeline moderno
+
+** 4.1. Task/amplification shader y mesh shader
+
+En Direct3D 12, la etapa opcional previa se llama *amplification shader* (AS). En Vulkan se denomina *task shader*. Ambas pueden filtrar trabajo y emitir grupos de mesh shaders. El mesh shader genera posiciones de vértice y conectividad de primitivas; el rasterizador continúa trabajando como antes.
+
+El esquema conceptual es:
+
+#+begin_example
+CPU: escena y recursos
+          |
+          v
+GPU: comandos DispatchMesh / vkCmdDrawMeshTasksEXT
+          |
+          v
+Task / Amplification shader (opcional)
+   - frustum, cono, LOD, oclusion
+   - decide cuantos grupos ejecutar
+          |
+          v
+Mesh shader
+   - carga vertices e indices locales
+   - transforma posiciones
+   - emite triangulos
+          |
+          v
+Rasterizador -> Fragment/Pixel shader -> Framebuffer
+#+end_example
+
+El task shader no es obligatorio. Para un primer prototipo puede lanzarse un mesh shader por meshlet y realizar el culling dentro del propio mesh shader, emitiendo cero primitivas si no es visible. Sin embargo, si queremos evitar también el coste de arrancar el grupo de mesh, conviene descartar trabajo en una etapa previa o en un compute pass.
+
+** 4.2. Ejemplo HLSL: un triángulo generado por un grupo
+
+El siguiente ejemplo ilustra las semánticas esenciales de un mesh shader en Shader Model 6.5 o superior. Es intencionadamente mínimo: no lee un meshlet real de memoria.
+
+#+begin_src hlsl
+struct VertexOut {
+    float4 position : SV_Position;
+    float3 color    : COLOR0;
+};
+
+[outputtopology("triangle")]
+[numthreads(32, 1, 1)]
+void main(
+    uint tid : SV_GroupIndex,
+    out vertices VertexOut verts[3],
+    out indices uint3 tris[1])
+{
+    SetMeshOutputCounts(3, 1);
+
+    if (tid == 0) {
+        verts[0].position = float4(-0.6, -0.6, 0.5, 1);
+        verts[1].position = float4( 0.0,  0.6, 0.5, 1);
+        verts[2].position = float4( 0.6, -0.6, 0.5, 1);
+        verts[0].color = float3(1, 0, 0);
+        verts[1].color = float3(0, 1, 0);
+        verts[2].color = float3(0, 0, 1);
+        tris[0] = uint3(0, 1, 2);
+    }
+}
+#+end_src
+
+=SetMeshOutputCounts= declara los tamaños efectivos de salida. Todos los hilos del grupo deben seguir un flujo de control compatible con los requisitos de la instrucción. Los arrays tienen capacidad estática, pero el número real de primitivas puede variar. La escritura por un único hilo aquí es didáctica; una implementación productiva reparte los vértices y triángulos entre las invocaciones.
+
+Un pixel shader asociado podría limitarse a devolver el color interpolado. La orientación del triángulo, la configuración de culling y las convenciones de coordenadas determinarán si aparece con el estado de rasterización elegido.
+
+** 4.3. Transformar 64 vértices con 32 hilos
+
+Para un meshlet real, si el grupo contiene 32 hilos y hay hasta 64 vértices, cada hilo puede procesar como máximo dos vértices:
+
+#+begin_src hlsl
+// Fragmento esquematico dentro de un mesh shader.
+for (uint i = tid; i < vertexCount; i += 32) {
+    uint globalIndex = vertexRemap[vertexOffset + i];
+    float3 p = positions[globalIndex];
+    verts[i].position = mul(viewProjection,
+                            float4(p, 1.0));
+}
+#+end_src
+
+Es necesario que todos los índices de primitivas referencien vértices válidos y que la salida quede escrita antes de ser consumida por el pipeline. La sincronización explícita solo es necesaria cuando los hilos dependen de datos compartidos producidos por otros hilos; no debe añadirse indiscriminadamente.
+
+** 4.4. Direct3D 12: comprobar soporte y despachar
+
+En Direct3D 12, la comprobación de características evita crear una pipeline incompatible:
+
+#+begin_src cpp
+D3D12_FEATURE_DATA_D3D12_OPTIONS7 opts{};
+HRESULT hr = device->CheckFeatureSupport(
+    D3D12_FEATURE_D3D12_OPTIONS7,
+    &opts, sizeof(opts));
+
+const bool mesh_supported =
+    SUCCEEDED(hr) &&
+    opts.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+#+end_src
+
+Después hay que crear un *pipeline state object* con mesh shader, pixel shader y, opcionalmente, amplification shader; no se combinan las etapas VS/GS clásicas con MS en el mismo pipeline. La API permite despachar mediante =ID3D12GraphicsCommandList6::DispatchMesh=, disponible a través de la interfaz correspondiente:
+
+#+begin_src cpp
+// cmd es un ID3D12GraphicsCommandList6* valido.
+// PSO, root signature, descriptores y render targets
+// deben estar configurados previamente.
+cmd->SetPipelineState(mesh_pso);
+cmd->DispatchMesh(meshlet_group_count, 1, 1);
+#+end_src
+
+Un error habitual consiste en pensar que basta con sustituir =DrawIndexedInstanced= por =DispatchMesh=. También cambia la organización de buffers, la compilación del shader, la firma de raíz y la estructura del PSO.
+
+** 4.5. Vulkan: extensión, límites y comandos
+
+En Vulkan, =VK_EXT_mesh_shader= introduce =VK_SHADER_STAGE_MESH_BIT_EXT= y, opcionalmente, =VK_SHADER_STAGE_TASK_BIT_EXT=. Hay que consultar las características mediante =VkPhysicalDeviceMeshShaderFeaturesEXT=, enlazándolas a la cadena =pNext= de la consulta de características, y verificar las propiedades y límites del dispositivo.
+
+#+begin_src cpp
+VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT
+};
+VkPhysicalDeviceFeatures2 features{
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2
+};
+features.pNext = &mesh_features;
+vkGetPhysicalDeviceFeatures2(physical_device, &features);
+
+if (!mesh_features.meshShader) {
+    // Usar la ruta tradicional de vertex/index buffers.
+}
+#+end_src
+
+La consulta por sí sola no habilita la característica: al crear el dispositivo lógico también hay que habilitar la extensión y las características correspondientes. Para emitir trabajo se usa =vkCmdDrawMeshTasksEXT=, normalmente obtenido como función de extensión:
+
+#+begin_src cpp
+// Tras habilitar la extension y crear una pipeline compatible.
+auto draw_mesh_tasks =
+    reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(
+        vkGetDeviceProcAddr(device, "vkCmdDrawMeshTasksEXT"));
+
+draw_mesh_tasks(cmd, group_count_x, 1, 1);
+#+end_src
+
+La extensión =VK_NV_mesh_shader= anterior no es idéntica a =VK_EXT_mesh_shader=. Sus modelos y nombres no deben mezclarse sin revisar la especificación. En GLSL para =EXT= se utilizan, entre otros, =GL_EXT_mesh_shader=, =SetMeshOutputsEXT= y =gl_PrimitiveTriangleIndicesEXT=.
+
+* 5. Rendimiento: dónde gana y dónde pierde
+
+** 5.1. El presupuesto real no son solo triángulos
+
+Un mesh shader consume registros, memoria compartida, ancho de banda y espacio de salida. Cuantos más atributos se emiten por vértice, mayor es la presión sobre los recursos. Una salida de 64 vértices con posición, normal, tangente y varios canales de textura puede ocupar bastante más que una salida que solo contiene posición.
+
+Si el grupo usa demasiados registros o memoria compartida, menos grupos pueden residir simultáneamente en un multiprocesador. Esto reduce la ocupación y dificulta ocultar latencias de memoria. Por ello, elegir el meshlet más grande posible no es necesariamente óptimo.
+
+** 5.2. Una estimación de coste
+
+Podemos modelar de forma simplificada:
+
+\[
+T_{\mathrm{clasico}}
+\approx T_{\mathrm{draw}}+N_v C_v+N_t C_t,
+\]
+
+\[
+T_{\mathrm{mesh}}
+\approx N_m C_{\mathrm{grupo}}
++N_m C_{\mathrm{culling}}
++N'_v C'_v+N'_t C'_t.
+\]
+
+Aquí =N_m= es el número de meshlets y las cantidades con prima representan trabajo después del filtrado. La fórmula omite paralelismo, cachés, fragment shading y solapamiento de etapas: no predice milisegundos reales. Sirve para observar la condición de victoria: el trabajo ahorrado debe compensar el coste de particionar, despachar y evaluar grupos.
+
+Si la escena consiste en pocos modelos pequeños siempre visibles, el pipeline tradicional puede ser igual de rápido o mejor. Si contiene geometría muy detallada con visibilidad irregular, la granularidad de los meshlets puede resultar ventajosa.
+
+** 5.3. Comparación con compute culling e indirect draws
+
+Un pipeline clásico avanzado puede ejecutar compute culling, compactar objetos visibles y lanzar =DrawIndexedIndirect= o =ExecuteIndirect=. Esto ofrece una ruta GPU-driven que funciona en más dispositivos y reutiliza el hardware clásico de vértices. Sus desventajas aparecen cuando la unidad de descarte sigue siendo demasiado gruesa o cuando generar y gestionar comandos por submalla resulta costoso.
+
+Mesh shaders permiten integrar de forma natural la generación de primitivas y el filtrado por meshlet. Pero no eliminan la necesidad de estructuras de visibilidad ni garantizan que el algoritmo sea mejor. En la práctica, conviene comparar ambas rutas con la misma geometría, resolución, cámara y criterio de LOD.
+
+** 5.4. Qué medir en una prueba seria
+
+Una evaluación útil debe registrar al menos: tiempo de GPU por pase; cantidad de meshlets considerados y emitidos; vértices y triángulos finalmente rasterizados; invocaciones de shaders; ocupación; ancho de banda; y tiempo de CPU de preparación de comandos.
+
+Conviene construir tres escenas: una con objetos enteramente visibles, otra con muchos objetos parcialmente visibles y una tercera con fuerte oclusión. Después variar el tamaño de meshlet, por ejemplo 32/64, 64/64 y 64/126 (vértices/triángulos), respetando límites y comprobando que la comparación no cambia el resultado visual.
+
+El perfilador de GPU y los contadores disponibles dependen del fabricante. Una captura de un solo fotograma no basta: deben medirse distribuciones y repetir pruebas tras calentar cachés y pipelines.
+
+* 6. Limitaciones y decisiones de arquitectura
+
+** 6.1. Compatibilidad
+
+No todas las GPU ni todas las plataformas soportan mesh shaders. Es prudente conservar una ruta tradicional basada en índices, especialmente si el motor apunta a hardware antiguo, dispositivos móviles o WebGPU, cuyo pipeline gráfico estándar no expone directamente la misma etapa mesh.
+
+** 6.2. Geometría animada
+
+En mallas estáticas es sencillo precalcular límites espaciales. Con *skinning*, morph targets o deformaciones procedurales, las esferas y conos pueden quedar obsoletos. Hay que calcular límites conservadores para la animación, actualizarlos en GPU o aceptar un culling menos agresivo. Un límite demasiado ajustado puede eliminar partes visibles del personaje.
+
+** 6.3. Transparencia y orden de rasterización
+
+El orden de las primitivas entre grupos no debe asumirse arbitrariamente, especialmente cuando se usan etapas de amplificación. Los objetos transparentes que dependen de blending ordenado siguen necesitando una estrategia de ordenación u otra técnica de transparencia independiente del orden. Mesh shaders no resuelven ese problema.
+
+** 6.4. Depuración
+
+Los errores pueden aparecer como triángulos corruptos por índices locales equivocados, huecos por culling demasiado agresivo o fallos de validación por exceder capacidades de salida. Resulta útil disponer de un modo que pinte cada meshlet con un color distinto, otro que dibuje sus esferas y un tercero que desactive progresivamente frustum, cono y oclusión.
+
+También conviene validar los datos offline:
+
+#+begin_src cpp
+bool valid_meshlet(const Meshlet& m,
+                   const MeshletData& data) {
+    if (m.vertex_count == 0 || m.vertex_count > 64) return false;
+    if (m.triangle_count == 0 || m.triangle_count > 126) return false;
+
+    const uint64_t v_end =
+        uint64_t(m.vertex_offset) + m.vertex_count;
+    const uint64_t t_end =
+        uint64_t(m.triangle_offset) + 3ull * m.triangle_count;
+
+    if (v_end > data.vertex_remap.size()) return false;
+    if (t_end > data.local_triangles.size()) return false;
+
+    for (uint64_t i = m.triangle_offset; i < t_end; ++i)
+        if (data.local_triangles[i] >= m.vertex_count)
+            return false;
+
+    return true;
+}
+#+end_src
+
+Este validador usa deliberadamente los presupuestos del ejemplo y no los máximos generales de la API. También deberían verificarse los índices globales contra el buffer real de vértices.
+
+* 7. Un plan de implementación incremental
+
+Para un motor propio en C++ conviene empezar sin task shader ni oclusión. Primero importar una malla, generar meshlets offline y guardar su remapeo e índices locales. Después dibujar un meshlet por grupo, sin culling, y comparar la imagen con una ruta indexada de referencia.
+
+En la segunda iteración se añaden esferas de culling y colores de depuración por meshlet. En la tercera se implementa un task shader o un compute pass para evitar grupos invisibles. Solo cuando estas etapas sean correctas tiene sentido incorporar conos de normales, LOD jerárquico y oclusión Hi-Z.
+
+La prioridad debe ser la *corrección conservadora*: un meshlet visible jamás debe desaparecer por error. Las optimizaciones agresivas se introducen acompañadas de contadores y capturas comparativas.
+
+Una estructura de datos compartida entre ambas rutas facilita experimentar. Por ejemplo, el mismo fichero de escena puede conservar índices tradicionales y meshlets precalculados; así se compara rendimiento sin modificar materiales, transformaciones o geometría de origen.
+
+* Conclusiones
+
+Los mesh shaders no sustituyen al rasterizador: sustituyen parte del modo en que se le suministra geometría. Su novedad más importante no es una instrucción concreta, sino permitir que el programa decida, por grupos de hilos, qué vértices y triángulos merece la pena generar.
+
+Los meshlets hacen posible un culling más fino que el de objetos completos. A cambio, introducen decisiones nuevas: particionado, duplicación de vértices, límites de salida, ocupación, calidad de los volúmenes envolventes y compatibilidad de hardware. La mejora no es automática. Una buena implementación debe justificar su complejidad con mediciones reales.
+
+La evolución resulta especialmente interesante vista desde los años noventa. Primero se trasladaron transformaciones e iluminación desde la CPU; después se programaron las operaciones por vértice y por píxel; ahora se programa también la propia *organización del trabajo geométrico*. Es un paso más hacia motores donde la CPU describe la escena y la GPU decide cada vez más cómo recorrerla.
+
+* Referencias originales y documentación
+
+- NVIDIA Developer Blog, «Introduction to Turing Mesh Shaders» (2018). Recomendaciones iniciales sobre meshlets, tamaños y organización de grupos: [[https://developer.nvidia.com/blog/introduction-turing-mesh-shaders/][Artículo técnico de NVIDIA]].
+- Microsoft, «Mesh Shader», especificación de DirectX: límites, amplification shaders, orden de rasterización y comandos: [[https://microsoft.github.io/DirectX-Specs/d3d/MeshShader.html][DirectX-Specs: Mesh Shader]].
+- Microsoft DirectX Developer Blog, «Announcing DirectX 12 Ultimate» (2020): contexto de adopción y explicación de mesh shading: [[https://devblogs.microsoft.com/directx/announcing-directx-12-ultimate/][DirectX 12 Ultimate]].
+- Khronos, especificación de Vulkan, capítulo «Mesh Shading»: semántica de task y mesh shaders: [[https://docs.vulkan.org/spec/latest/chapters/VK_NV_mesh_shader/mesh.html][Vulkan Mesh Shading]].
+- Khronos, propuesta y diseño de =VK_EXT_mesh_shader=: [[https://github.com/KhronosGroup/Vulkan-Docs/blob/main/proposals/VK_EXT_mesh_shader.adoc][Propuesta de extensión]].
+- Khronos, =GLSL_EXT_mesh_shader=: sintaxis y salida de primitivas: [[https://github.com/KhronosGroup/GLSL/blob/main/extensions/ext/GLSL_EXT_mesh_shader.txt][Extensión GLSL]].
+- Zeux, =meshoptimizer=: biblioteca abierta para optimizar mallas y construir meshlets; consultar su documentación y ejemplos para la implementación offline: [[https://github.com/zeux/meshoptimizer][Repositorio de meshoptimizer]].
