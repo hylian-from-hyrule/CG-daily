@@ -1,0 +1,373 @@
+#+TITLE: 3dfx Voodoo y Glide: anatomía de una tubería de píxeles de 1996
+#+DATE: <2026-11-17 Tue>
+#+LANGUAGE: es
+#+FILETAGS: :historia:retro:3dfx:glide:rasterizacion:gpu:
+#+OPTIONS: toc:2 num:t
+
+* Introducción: cuando acelerar 3D significaba acelerar píxeles
+
+En 1996, un PC podía transformar y proyectar triángulos mediante su CPU, pero colorear cientos de miles de píxeles con texturas, profundidad y transparencia seguía siendo costoso. La primera Voodoo Graphics de 3dfx no pretendía ser una GPU programable ni sustituir a la tarjeta 2D: era un coprocesador especializado en rasterización. El juego enviaba triángulos ya proyectados y la tarjeta resolvía el trabajo repetitivo de cada fragmento.
+
+La diferencia histórica es importante. En una GPU actual, un shader de vértices transforma geometría, un shader de fragmentos ejecuta código arbitrario y varias unidades de cómputo comparten una jerarquía de memoria. En Voodoo, el programador configuraba una cadena de operaciones fijas. El hardware era extraordinariamente eficaz en un conjunto limitado de tareas, pero no podía ejecutar una fórmula de iluminación inventada por el desarrollador.
+
+Este artículo estudia el diseño de la primera Voodoo, no el de Voodoo2 ni el de Voodoo3. Separaremos cuidadosamente las características de cada generación: la Voodoo Graphics típica tenía una sola unidad de texturas (TMU), mientras que Voodoo2 incorporó dos y abrió la puerta al multitexturizado en una pasada. Los manuales originales de Glide 2.4 y las especificaciones SST-1 conservadas en Bitsavers son nuestras referencias primarias [1–3].
+
+* El problema de 1996: demasiados fragmentos para la CPU
+
+** De la proyección al framebuffer
+
+Un motor 3D clásico recorría una secuencia conceptual:
+
+1. Transformar vértices del espacio del objeto al de cámara.
+2. Recortar geometría contra el volumen visible.
+3. Proyectar a coordenadas de pantalla.
+4. Determinar qué píxeles cubre cada triángulo.
+5. Interpolar atributos, consultar texturas y comparar profundidad.
+6. Mezclar el color resultante con el framebuffer.
+
+La CPU podía ejecutar los primeros pasos con matemáticas de matrices, a menudo con aritmética de punto fijo. El problema era que los últimos pasos se repetían por cada píxel cubierto. Una escena de apenas varios miles de triángulos podía producir centenares de miles de muestras de textura por fotograma. Además, la transparencia y el overdraw obligaban a procesar varias veces el mismo píxel.
+
+Tomemos una imagen de 640 × 480: contiene 307.200 píxeles. A 30 imágenes por segundo, pintar cada posición una sola vez supone 9,22 millones de píxeles por segundo. Con un overdraw medio de 2,5, ya son unos 23 millones de fragmentos por segundo antes de contabilizar operaciones adicionales. No es una medición de un juego real: es una estimación que muestra por qué la tasa de relleno, o /fill rate/, era una magnitud comercial decisiva.
+
+** La decisión de 3dfx
+
+3dfx separó el trabajo geométrico del trabajo por píxel. La CPU entregaba coordenadas de pantalla, colores, profundidad y parámetros de textura. Voodoo se ocupaba de rasterizar triángulos, interpolar, filtrar texturas, aplicar pruebas de profundidad y escribir los resultados.
+
+Esto resolvía un cuello de botella sin asumir el coste de un procesador gráfico general. También explicaba una limitación: una escena con demasiados vértices o cambios de estado seguía siendo cara para la CPU y el bus PCI. Acelerar fragmentos no equivalía a acelerar toda la aplicación.
+
+* Una placa peculiar: PixelFX, TexelFX y cable VGA
+
+** Dos chips, dos memorias lógicas
+
+El diseño SST-1 separaba las funciones de PixelFX y TexelFX. En una configuración común de 4 MiB, aproximadamente 2 MiB se dedicaban al framebuffer y al buffer de profundidad y otros 2 MiB a texturas. Eran dominios de memoria físicamente separados, no una reserva unificada que pudiera reasignarse libremente según las necesidades de la escena.
+
+PixelFX recibía el trabajo de rasterización y composición de píxeles; TexelFX realizaba el direccionamiento, filtrado y combinación de texturas. La primera Voodoo disponía normalmente de una TMU. No confundamos la presencia de dos chips con dos unidades de texturas: esa segunda TMU es característica de configuraciones posteriores como Voodoo2.
+
+La frecuencia nominal de referencia rondaba los 50 MHz. La cifra teórica de píxeles por segundo no es un FPS garantizado: el coste de triángulos pequeños, accesos a memoria, escrituras, blending y cambios de estado reduce el rendimiento efectivo.
+
+** ¿Por qué necesitaba otra tarjeta 2D?
+
+Voodoo Graphics no era la tarjeta que dibujaba el escritorio de Windows. El monitor se conectaba a la Voodoo y un cable analógico /pass-through/ enlazaba la salida VGA de la tarjeta 2D con la entrada de la aceleradora. En modo 2D se dejaba pasar la señal; al activar el modo 3D, la Voodoo generaba su propia salida.
+
+Esta arquitectura era pragmática: permitía vender una aceleradora especializada compatible con numerosos PC ya existentes. El precio era un cable adicional, una conmutación de señal y posibles pérdidas de calidad analógica. La integración 2D/3D que después se convirtió en norma eliminó esta peculiaridad.
+
+* La memoria explica la resolución
+
+** Cálculo del coste del framebuffer
+
+Un framebuffer RGB 565 necesita 16 bits, es decir, 2 bytes por píxel. Para 640 × 480:
+
+\[
+B_{\mathrm{color}} = 640\cdot480\cdot2 = 614\,400\ \mathrm{bytes}.
+\]
+
+Dos buffers de color consumen 1.228.800 bytes. Un Z-buffer de 16 bits añade otros 614.400. El total es:
+
+\[
+B_{\mathrm{total}} = 3\cdot614\,400 = 1\,843\,200\ \mathrm{bytes},
+\]
+
+aproximadamente 1,76 MiB, sin contar alineamientos ni reservas internas. Cabe en 2 MiB de memoria de framebuffer. Si elevamos la resolución a 800 × 600, cada plano ocupa 960.000 bytes; tres planos requieren 2.880.000 bytes y ya no caben.
+
+De aquí procede una restricción clásica de las tarjetas de 4 MiB: 640 × 480 con doble buffer y Z-buffer era una configuración práctica, mientras que ciertas resoluciones mayores exigían renunciar a funciones o cambiar de configuración. No hay que confundir el límite de memoria con la capacidad del conversor digital-analógico o con los modos exactos admitidos por cada placa.
+
+** El coste oculto de la precisión
+
+RGB 565 asigna cinco bits al rojo, seis al verde y cinco al azul. El paso entre dos valores de rojo normalizados es aproximadamente 1/31; el del verde, 1/63. En degradados suaves, los escalones se vuelven visibles.
+
+El dithering distribuye errores de cuantización entre píxeles vecinos o posiciones de una matriz. No crea más precisión física en el framebuffer: hace que el ojo perciba un promedio espacial más próximo al color ideal. Por eso una captura digital de 16 bits y la imagen observada en un CRT analógico pueden dar impresiones distintas.
+
+* Cómo se rasteriza un triángulo
+
+** Funciones de borde y coordenadas de pantalla
+
+Sean los vértices proyectados \(A=(x_0,y_0)\), \(B=(x_1,y_1)\) y \(C=(x_2,y_2)\). Una función de borde orientada para AB es:
+
+\[
+E_{AB}(x,y)=(x-x_0)(y_1-y_0)-(y-y_0)(x_1-x_0).
+\]
+
+Su signo indica de qué lado de la recta AB se encuentra un punto. Si el triángulo tiene orientación coherente, el píxel pertenece a él cuando satisface las tres pruebas de borde, con una convención explícita para los puntos exactamente sobre una arista.
+
+La convención de inclusión de bordes importa: si dos triángulos comparten una diagonal, incluir ambos lados puede escribir dos veces algunos píxeles; excluir ambos puede dejar grietas. Las reglas tipo /top-left/ resuelven el empate de forma determinista. No atribuimos aquí una implementación interna exacta a SST-1: presentamos el fundamento matemático habitual de un rasterizador de triángulos.
+
+** Interpolación baricéntrica
+
+Definamos el área orientada \(D=E_{AB}(C)\). Los pesos baricéntricos pueden obtenerse a partir de áreas parciales:
+
+\[
+\lambda_A=\frac{E_{BC}(P)}{D},\quad
+\lambda_B=\frac{E_{CA}(P)}{D},\quad
+\lambda_C=\frac{E_{AB}(P)}{D}.
+\]
+
+Cuando \(P\) está dentro, los pesos suman uno. Para un atributo lineal en pantalla, como una componente de color Gouraud, usamos:
+
+\[
+c(P)=\lambda_A c_A+\lambda_B c_B+\lambda_C c_C.
+\]
+
+En hardware, no hace falta recalcular toda la fórmula para cada píxel: cada función de borde es afín en \(x,y\). Al avanzar un píxel horizontalmente, se suma una constante. Este es el motivo de que las arquitecturas de rasterización puedan ser muy eficientes con incrementadores y registros.
+
+#+begin_src cpp
+struct Vec2 { float x, y; };
+
+float edge(Vec2 a, Vec2 b, Vec2 p) {
+    return (p.x - a.x) * (b.y - a.y)
+         - (p.y - a.y) * (b.x - a.x);
+}
+
+bool inside_ccw(Vec2 a, Vec2 b, Vec2 c, Vec2 p) {
+    // Versión pedagógica: no implementa la regla top-left.
+    const float d = edge(a, b, c);
+    if (d == 0.0f) return false;
+    const float s = d > 0.0f ? 1.0f : -1.0f;
+    return s * edge(a, b, p) >= 0.0f
+        && s * edge(b, c, p) >= 0.0f
+        && s * edge(c, a, p) >= 0.0f;
+}
+#+end_src
+
+Este código sirve para estudiar cobertura; un rasterizador productivo usaría coordenadas de punto fijo, una regla consistente de bordes y evaluación incremental.
+
+* Texturas: interpolación proyectiva y filtrado
+
+** Por qué no basta con interpolar u y v
+
+Supongamos un triángulo inclinado respecto a la cámara. Si interpolamos linealmente las coordenadas \(u,v\) en pantalla, las líneas de la textura parecen deformarse. El error procede de la división en perspectiva.
+
+Después de la proyección, la relación entre una coordenada de textura y el espacio de pantalla es racional. Si cada vértice tiene coordenada \(u_i\) y profundidad homogénea \(w_i\), interpolamos:
+
+\[
+q_i=\frac{1}{w_i}, \qquad r_i=\frac{u_i}{w_i}.
+\]
+
+Para un punto de pantalla con pesos baricéntricos:
+
+\[
+u(P)=
+\frac{\lambda_A r_A+\lambda_B r_B+\lambda_C r_C}
+     {\lambda_A q_A+\lambda_B q_B+\lambda_C q_C}.
+\]
+
+La misma expresión vale para \(v\). Esta corrección no es un adorno visual: es necesaria para que una textura sobre un plano conserve la geometría proyectiva.
+
+Glide expone en sus estructuras de vértices campos relacionados con coordenadas de textura y recíprocos de profundidad; la aplicación debe suministrar valores en la convención esperada por la versión concreta de la API. El manual original es la autoridad para esos campos [1,2].
+
+** Filtrado bilineal
+
+Para muestrear una textura en una posición fraccionaria \((u,v)\), encontramos los cuatro texeles vecinos \(T_{00},T_{10},T_{01},T_{11}\). Con partes fraccionarias \(a,b\), el color filtrado es:
+
+\[
+T(u,v)=(1-b)[(1-a)T_{00}+aT_{10}]
+      +b[(1-a)T_{01}+aT_{11}].
+\]
+
+La operación suaviza las transiciones entre texeles, pero no resuelve por sí sola el aliasing de texturas lejanas. Para ello se utilizan niveles mipmap, una pirámide de imágenes reducidas. La Voodoo podía elegir niveles de detalle y realizar filtrado de textura, aunque las combinaciones exactas de filtrado dependen del hardware y del número de TMU. En particular, no debemos atribuir el filtrado trilineal en una sola pasada de Voodoo2 a la primera Voodoo.
+
+** ¿Cuánto ocupa una textura con mipmaps?
+
+Una textura cuadrada de \(256^2\) texeles a 16 bits ocupa 131.072 bytes en el nivel principal. Sumando todos los niveles hasta \(1^2\), el coste geométrico tiende a:
+
+\[
+B_{\mathrm{mips}} \simeq B_0\left(1+\frac14+\frac1{16}+\cdots\right)
+=\frac43 B_0.
+\]
+
+Es decir, alrededor de 174.763 bytes antes de alineamientos. Con apenas 2 MiB de memoria de texturas, una docena de recursos de ese tamaño ya supone una presión considerable. Los motores tenían que organizar descargas, paletas, formatos compactos y reutilización de texturas; no podían comportarse como si toda la colección de recursos residiera permanentemente en VRAM.
+
+* Glide: una API que describe directamente la máquina
+
+** Por qué Glide era distinta de OpenGL
+
+Glide era una API propietaria de bajo nivel orientada al hardware 3dfx. No proporcionaba una escena, una cámara o un motor de materiales. El desarrollador configuraba estados, preparaba vértices y enviaba triángulos. Esta cercanía al hardware reducía abstracciones, pero hacía menos portable el motor.
+
+OpenGL ofrecía una interfaz estandarizada con transformaciones, iluminación y estados de mayor nivel; Direct3D también evolucionaba como API general. Glide podía ser una ruta eficiente para la Voodoo, a cambio de obligar al juego a mantener un backend específico. Muchos motores soportaban varias rutas de renderizado precisamente por esta fragmentación del mercado.
+
+** Secuencia de inicialización y dibujo
+
+Un ejemplo conceptual de Glide 2.x, deliberadamente abreviado, muestra el modelo mental:
+
+#+begin_src c
+/* Esquema ilustrativo: requiere glide.h, SDK y contexto válido. */
+grGlideInit();
+/* Seleccionar placa y abrir contexto de pantalla con grSstWinOpen(...). */
+grColorCombine(GR_COMBINE_FUNCTION_SCALE_OTHER,
+               GR_COMBINE_FACTOR_ONE,
+               GR_COMBINE_LOCAL_NONE,
+               GR_COMBINE_OTHER_TEXTURE,
+               FXFALSE);
+grDepthBufferMode(GR_DEPTHBUFFER_ZBUFFER);
+grDepthBufferFunction(GR_CMP_LESS);
+grBufferClear(0, 0, GR_WDEPTHVALUE_FARTHEST);
+
+/* Tras preparar tres GrVertex con coordenadas de pantalla,
+   atributos de color, profundidad y textura: */
+grDrawTriangle(&a, &b, &c);
+grBufferSwap(1);
+/* Al finalizar: cerrar contexto y llamar a grGlideShutdown(). */
+#+end_src
+
+Este fragmento expresa la intención, no es un programa completo listo para compilar: omite la apertura del contexto, la inicialización de =a,b,c= y la carga de textura. Las enumeraciones y parámetros deben cotejarse con los encabezados del SDK elegido [1,2]. La lección importante es que no se compila un shader: se configura una red fija de operaciones.
+
+** La ruta real de una textura
+
+El manual de Glide documenta una secuencia basada en =GrTexInfo=: describir formato, dimensiones y mipmaps; calcular memoria necesaria; descargar la cadena a la TMU; y asociar la dirección de textura antes de dibujar. Entre las funciones relevantes están:
+
+#+begin_src c
+/* Pseudocódigo de gestión de textura Glide 2.x */
+FxU32 bytes = grTexCalcMemRequired(
+    info.smallLod, info.largeLod,
+    info.aspectRatio, info.format);
+
+/* Reservar 'bytes' dentro del intervalo válido de GR_TMU0.
+   La aplicación administra direcciones y alineamientos. */
+grTexDownloadMipMap(GR_TMU0, gpu_addr,
+                    GR_MIPMAPLEVELMASK_BOTH, &info);
+grTexSource(GR_TMU0, gpu_addr,
+            GR_MIPMAPLEVELMASK_BOTH, &info);
+#+end_src
+
+La API no equivale a =glTexImage2D=: el programador debe pensar explícitamente en el espacio de memoria de la TMU. Si dos texturas ocupan direcciones solapadas, la aplicación ha creado su propio problema de corrupción de recursos. La descarga de mipmaps tampoco es gratis: conviene agrupar geometría por material para reducir cambios de estado y transferencias.
+
+* Combinar colores sin shaders
+
+** La ecuación de la tubería fija
+
+Un material típico necesita multiplicar el color de una textura por el color interpolado del vértice:
+
+\[
+C_{\mathrm{salida}} = C_{\mathrm{textura}}\cdot C_{\mathrm{vértice}}.
+\]
+
+Otra operación habitual es el blending alfa:
+
+\[
+C_{\mathrm{final}} = \alpha C_{\mathrm{fuente}}
+                    +(1-\alpha)C_{\mathrm{destino}}.
+\]
+
+En una GPU programable estas fórmulas caben en pocas líneas de shader. En Glide se expresan seleccionando fuentes, factores y funciones de combinación. =grTexCombine= controla la combinación en las TMU; =grColorCombine= configura la composición de color posterior; =grAlphaBlendFunction= establece los factores de mezcla con el framebuffer [2].
+
+El detalle clave es que no toda expresión algebraica es representable. Si queremos una BRDF físicamente basada con términos especulares, Fresnel y múltiples luces por fragmento, no basta con buscar una combinación de enumeraciones. La tubería fija no tiene instrucciones arbitrarias ni almacenamiento temporal equivalente al de un shader moderno.
+
+** Orden de transparencia y Z-buffer
+
+La transparencia convencional introduce una dependencia de orden. Si dibujamos dos superficies translúcidas A y B, en general:
+
+\[
+\operatorname{blend}(A,\operatorname{blend}(B,D))
+\neq
+\operatorname{blend}(B,\operatorname{blend}(A,D)).
+\]
+
+Por ello, una estrategia común era dibujar primero geometría opaca con escritura de profundidad y después objetos transparentes aproximadamente de atrás hacia delante, normalmente sin actualizar Z. Las pruebas de profundidad aún podían descartar fragmentos transparentes ocultos por superficies opacas.
+
+Esta solución no resuelve correctamente triángulos transparentes entrelazados ni intersecciones complejas. Es una limitación del blending ordenado, no un defecto exclusivo de Voodoo. Técnicas modernas de /order-independent transparency/ atacan precisamente este problema con más memoria y trabajo.
+
+* El presupuesto de rendimiento: píxeles, triángulos y bus
+
+** Fill rate frente a geometría
+
+La frecuencia de reloj y la tasa máxima de píxeles describen un límite superior bajo condiciones favorables. En la práctica conviene separar:
+
+- /Coste geométrico/: transformar, recortar y preparar triángulos en CPU.
+- /Coste de configuración/: cambios de textura, blending y otros estados.
+- /Coste de fragmentos/: interpolar, muestrear, comparar Z y mezclar.
+- /Coste de transferencia/: subir recursos y enviar comandos por PCI.
+
+Un motor podía ser /fill-rate bound/ al pintar paredes grandes con varias pasadas, pero /CPU bound/ al dibujar miles de triángulos diminutos. La solución no era siempre bajar la resolución: eso reduce fragmentos, pero apenas modifica el número de vértices o llamadas de dibujo.
+
+** Un cálculo de overdraw
+
+Consideremos una escena con 200.000 píxeles visibles de geometría opaca y overdraw medio 3. Se procesan unos 600.000 fragmentos. Si el hardware pudiera sostener 45 millones de fragmentos por segundo en ese escenario idealizado, el límite puramente aritmético sería:
+
+\[
+45\,000\,000 / 600\,000 = 75\ \mathrm{fotogramas/s}.
+\]
+
+No significa que el juego alcance 75 FPS: hemos ignorado coste de triángulos, texturas, memoria, CPU, sincronización y las condiciones de la cifra nominal. El cálculo solo permite identificar la sensibilidad al overdraw. Si lo reducimos de 3 a 2, el presupuesto de fragmentos cae un tercio.
+
+** Organización de un renderer de 1997
+
+Un diseño razonable de motor para Voodoo podía agrupar triángulos por textura, ordenar la geometría opaca para reducir cambios de estado, recortar en CPU y limitar el número de superficies translúcidas. También era importante escoger texturas pequeñas y reservar la memoria de TMU con cuidado.
+
+El orden por material y el orden frontal para reducir overdraw pueden entrar en conflicto. Un renderer real debe medir qué coste domina: a veces conviene agrupar texturas y otras priorizar una profundidad temprana efectiva. No debemos asumir que el hardware de 1996 implementaba exactamente los mecanismos de /early-Z/ de las GPU actuales.
+
+* Comparación con Voodoo2, OpenGL y una GPU actual
+
+** Lo que cambió en 1998
+
+Voodoo2 elevó frecuencias y añadió una segunda TMU. Con dos unidades de textura, ciertas operaciones que en Voodoo Graphics requerían dos pasadas podían hacerse en una sola. Esto es especialmente relevante para texturas de detalle, mapas de luz y combinaciones de materiales. Dos TMU no equivalen a dos shaders: siguen siendo bloques de función fija con un repertorio limitado de combinaciones.
+
+El modelo de programación de Glide evolucionó con el hardware. Conviene consultar la guía 2.4 para Voodoo Graphics y la 3.0 para generaciones posteriores, en vez de mezclar ejemplos y prometer que cualquier llamada funciona igual en todas las placas.
+
+** Del combinador a un fragment shader
+
+El equivalente moderno conceptual de un material modulado es:
+
+#+begin_src glsl
+#version 330 core
+in vec2 uv;
+in vec4 vertex_color;
+uniform sampler2D albedo;
+out vec4 frag_color;
+
+void main() {
+    vec4 texel = texture(albedo, uv);
+    frag_color = texel * vertex_color;
+}
+#+end_src
+
+En este caso, la interpolación proyectiva de =uv= la resuelve automáticamente la etapa de rasterización moderna si el atributo usa la interpolación perspectiva predeterminada. El shader expresa una operación que en Glide requería configurar combinadores.
+
+La ventaja moderna es la libertad: el mismo shader puede consultar normales, sombras, materiales y datos estructurados. El coste es mayor complejidad de compilación, estados, sincronización y acceso a recursos. La API fija no era «inferior» para todos los problemas: era una solución especializada al presupuesto de transistores, memoria y CPU de su época.
+
+** Un experimento reproducible sin hardware antiguo
+
+Para entender las decisiones de 3dfx, implementa un rasterizador software con tres modos:
+
+1. Textura con interpolación afín de UV.
+2. Textura con interpolación perspectiva usando =u/w=, =v/w= y =1/w=.
+3. El segundo modo más filtrado bilineal y cuantización final RGB 565.
+
+Dibuja un suelo cuadriculado inclinado y mide la diferencia. Después añade un contador de fragmentos y coloca varias paredes superpuestas. El contador mostrará por qué la profundidad y el orden de dibujo importan. Finalmente, limita artificialmente la memoria de texturas a 2 MiB y observa cómo cambia el diseño del gestor de recursos.
+
+No hace falta emular registros de SST-1 para aprender la arquitectura: basta reproducir sus restricciones fundamentales y compararlas con una implementación actual en OpenGL, Vulkan o WebGPU.
+
+* Limitaciones, matices y errores frecuentes
+
+** No era una GPU de transformaciones
+
+La primera Voodoo no ejecutaba el pipeline geométrico completo del juego. La CPU preparaba triángulos proyectados; la tarjeta aceleraba principalmente rasterización y operaciones por píxel. La llegada posterior del Transform & Lighting por hardware es otro hito, distinto de la aceleración de texturas de 1996.
+
+** No tenía dos TMU por tener dos chips
+
+PixelFX y TexelFX cumplían funciones distintas. La segunda unidad de texturas de Voodoo2 no debe trasladarse retrospectivamente a Voodoo Graphics. Esta confusión produce descripciones incorrectas de multitexturizado y filtrado trilineal.
+
+** «16 bits» no describe toda la precisión interna
+
+El framebuffer RGB 565 es de 16 bits por píxel, pero las operaciones intermedias de filtrado, mezcla y dithering no deben equipararse automáticamente a una multiplicación de enteros de cinco bits. La calidad visual depende de la precisión interna y del momento en que se cuantiza el resultado.
+
+** Glide no sustituía a un motor
+
+Glide facilitaba acceso al hardware; no resolvía gestión de escenas, colisiones, animación, carga de niveles ni ordenación global de objetos. Tampoco garantizaba portabilidad. Precisamente por eso los motores de la época acabaron manteniendo rutas para Glide, OpenGL, Direct3D o software.
+
+* Conclusiones
+
+La primera Voodoo es un excelente ejemplo de especialización arquitectónica. En lugar de construir una GPU universal, 3dfx identificó el trabajo que más se repetía por fotograma y lo convirtió en una cadena de hardware de función fija. El resultado fue una mejora enorme de la experiencia 3D en un PC típico, con filtrado de texturas, profundidad y blending que la CPU habría tenido dificultades para sostener a resoluciones comparables.
+
+Su diseño revela tres ideas que siguen vigentes: la memoria disponible condiciona las características visibles; la tasa máxima de cómputo no basta para predecir el rendimiento; y el modelo de programación refleja la arquitectura física. Hoy usamos shaders y memoria mucho más flexible, pero todavía optimizamos overdraw, accesos a texturas, cambios de estado y movimiento de datos.
+
+Mirar Voodoo desde una perspectiva moderna no consiste en admirar únicamente sus cifras. Consiste en comprender por qué un acelerador que solo sabía hacer unas pocas cosas pudo transformar la industria: esas pocas cosas eran exactamente las que más tiempo consumían.
+
+* Referencias originales y lecturas complementarias
+
+1. 3Dfx Interactive, /Glide Programming Guide 2.4/ (1997), copia histórica del documento original: [[https://bitsavers.trailing-edge.com/components/3dfx/Glide_Programming_Guide_2.4_199707.pdf][PDF en Bitsavers]].
+2. 3Dfx Interactive, /Glide Reference Manual 2.4/ (1997), especificaciones originales de =grTexCombine=, =grTexSource= y =grDrawTriangle=: [[https://bitsavers.trailing-edge.com/components/3dfx/Glide_Reference_Manual_2.4_199707.pdf][PDF en Bitsavers]].
+3. 3Dfx Interactive, /Voodoo Graphics SST-1 Specification, revision 1.61/, documento técnico original conservado en archivo: [[https://bitsavers.trailing-edge.com/components/3dfx/Voodoo1_SST-1_Spec_r1.61_199912.pdf][PDF en Bitsavers]].
+4. 3Dfx Interactive, /Glide Programming Guide 3.0/ (1998), para comparar evolución de la API y generaciones posteriores: [[https://bitsavers.trailing-edge.com/components/3dfx/Glide_Programming_Guide_3.0_199806.pdf][PDF en Bitsavers]].
+5. 3Dfx Interactive, /Voodoo2 Specification, revision 1.16/, fuente primaria para contrastar características de Voodoo2: [[https://bitsavers.trailing-edge.com/components/3dfx/Voodoo2_Spec_r1.16_199912.pdf][PDF en Bitsavers]].
+6. Transcripción histórica del /Glide Programming Guide/ 2.3.1, útil para localizar ejemplos de configuración de textura: [[https://www.gamers.org/dEngine/xf3D/glide/glidepgm.htm][gamers.org]].
+
+Las fechas de revisión de los documentos técnicos no equivalen necesariamente a la fecha de lanzamiento del hardware. Los enlaces remiten a copias archivadas de manuales originales, no a estudios académicos revisados por pares. No se incluyen imágenes externas ni diagramas que requieran recursos adicionales.
