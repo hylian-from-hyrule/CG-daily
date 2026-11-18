@@ -1,0 +1,66 @@
+name: Publicar artículos y RSS en GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'articulos/**'
+      - 'index.org'
+      - 'scripts/build-site.py'
+      - 'scripts/export-article.el'
+      - 'scripts/site.css'
+      - '.github/workflows/publish-rss-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-rss-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Exportar HTML y RSS con Emacs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del repositorio privado
+        uses: actions/checkout@v4
+
+      - name: Instalar Emacs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends emacs-nox
+
+      - name: Construir web pública y feed RSS
+        env:
+          SITE_BASE_URL: https://hylian-from-hyrule.github.io/CG-daily/
+        run: |
+          set -euo pipefail
+          python3 scripts/build-site.py
+          test -s _site/index.html
+          test -s _site/feed.xml
+          test -f _site/.nojekyll
+
+      - name: Preparar Pages
+        uses: actions/configure-pages@v5
+
+      - name: Subir únicamente los archivos públicos
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: Publicar en GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Desplegar web y RSS
+        id: deployment
+        uses: actions/deploy-pages@v4
