@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
+from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parent.parent
 SITE = ROOT / "_site"
@@ -73,12 +74,32 @@ def build() -> None:
              str(source), str(output), css_path],
             check=True, cwd=ROOT
         )
+        # Build a self-contained, reflowable EPUB3 for each article.
+        epub_rel = source.relative_to(ROOT).with_suffix(".epub")
+        epub_output = SITE / epub_rel
+        subprocess.run(
+            ["pandoc", str(source), "--from=org", "--to=epub3",
+             "--standalone", "--toc", "--toc-depth=2",
+             "--metadata=title:" + title,
+             "--metadata=date:" + date.date().isoformat(),
+             "--metadata=lang:es-ES",
+             "--resource-path=" + os.pathsep.join((str(source.parent), str(ROOT))),
+             "--css=" + str(ROOT / "scripts/epub.css"),
+             "--output=" + str(epub_output)],
+            check=True, cwd=ROOT
+        )
+        with ZipFile(epub_output) as epub:
+            if epub.testzip() is not None or "META-INF/container.xml" not in epub.namelist():
+                raise RuntimeError(f"Invalid EPUB: {epub_output}")
         fragment_path = Path(str(output) + ".fragment")
         fragment = fragment_path.read_text(encoding="utf-8")
         fragment_path.unlink()
         url = urljoin(BASE_URL, rel.as_posix())
         articles.append({"title": title, "date": date, "url": url,
                          "relative": rel.as_posix(),
+                         "epub_relative": epub_rel.as_posix(),
+                         "epub_url": urljoin(BASE_URL, epub_rel.as_posix()),
+                         "epub_bytes": epub_output.stat().st_size,
                          "fragment": make_absolute_links(fragment, url)})
     # Copy only the image/diagram assets referenced by the public HTML.
     for assets in SOURCE.glob("*/*/assets"):
@@ -97,7 +118,9 @@ def build() -> None:
             items.append(
                 f'<li><time datetime="{article["date"].date()}">{date}</time>'
                 f'<a href="{escape(article["relative"], quote=True)}">'
-                f'{escape(article["title"])}</a></li>')
+                f'{escape(article["title"])}</a> '
+                f'<a class="download" href="{escape(article["epub_relative"], quote=True)}" '
+                f'download>EPUB</a></li>')
         items.append("</ul>")
     index = f"""<!doctype html>
 <html lang="es"><head><meta charset="utf-8">
@@ -135,10 +158,18 @@ de los gráficos 3D: arquitecturas GPU, rasterización, APIs y algoritmos.</p>
         ET.SubElement(item, "link").text = article["url"]
         ET.SubElement(item, "guid", {"isPermaLink": "true"}).text = article["url"]
         ET.SubElement(item, "pubDate").text = format_datetime(article["date"])
+        ET.SubElement(item, "enclosure", {
+            "url": article["epub_url"],
+            "length": str(article["epub_bytes"]),
+            "type": "application/epub+zip",
+        })
         ET.SubElement(item, "description").text = (
             "Artículo técnico completo disponible en esta entrada RSS y en la web."
         )
-        ET.SubElement(item, f"{{{CONTENT_NS}}}encoded").text = article["fragment"]
+        ET.SubElement(item, f"{{{CONTENT_NS}}}encoded").text = (
+            '<p><a href="' + escape(article["epub_url"], quote=True) +
+            '">Descargar este artículo en EPUB</a></p>' + article["fragment"]
+        )
     ET.indent(rss, space="  ")
     ET.ElementTree(rss).write(SITE / "feed.xml", encoding="utf-8",
                               xml_declaration=True)
@@ -146,7 +177,12 @@ de los gráficos 3D: arquitecturas GPU, rasterización, APIs y algoritmos.</p>
     parsed = ET.parse(SITE / "feed.xml")
     count = len(parsed.findall("./channel/item"))
     assert count == min(len(articles), 45), (count, len(articles))
-    print(f"Built {len(articles)} HTML articles and {count} full-text RSS items")
+    for item in parsed.findall("./channel/item"):
+        enclosure = item.find("enclosure")
+        assert enclosure is not None
+        assert enclosure.get("type") == "application/epub+zip"
+        assert int(enclosure.get("length", "0")) > 0
+    print(f"Built {len(articles)} HTML and EPUB articles, with {count} RSS enclosures")
     print(f"RSS URL: {urljoin(BASE_URL, 'feed.xml')}")
 
 if __name__ == "__main__":
