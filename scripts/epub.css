@@ -1,0 +1,14 @@
+/* Reflowable EPUB styling; reader font and theme settings take precedence. */
+body { font-family: serif; line-height: 1.55; }
+h1, h2, h3, h4 { line-height: 1.25; page-break-after: avoid; }
+h1 { font-size: 1.6em; }
+h2 { font-size: 1.35em; margin-top: 1.6em; }
+h3 { font-size: 1.15em; margin-top: 1.3em; }
+p { margin: .7em 0; }
+pre, code { font-family: monospace; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .82em; line-height: 1.4; }
+code { font-size: .88em; }
+img, svg { max-width: 100%; height: auto; }
+table { border-collapse: collapse; width: 100%; font-size: .85em; }
+th, td { border: 1px solid #888; padding: .3em; }
+blockquote { border-left: .2em solid #888; margin: 1em 0; padding-left: 1em; }
