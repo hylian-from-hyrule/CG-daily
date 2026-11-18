@@ -1,0 +1,423 @@
+#+TITLE: Render graphs: dependencias, barreras y memoria transitoria en una GPU moderna
+#+DATE: <2026-11-18 Wed>
+#+LANGUAGE: es
+#+FILETAGS: :moderno:gpu:vulkan:arquitectura:render-graph:
+#+OPTIONS: toc:2 num:t
+
+* Introducción: cuando dibujar deja de ser una lista de órdenes
+
+En un renderizador pequeño, el fotograma parece una receta: limpiar la pantalla, dibujar geometría, aplicar iluminación y presentar. En un motor moderno, cada paso produce imágenes y buffers que otros pasos consumen. Hay sombras, reflejos, profundidad, normales, desenfoque, iluminación volumétrica, exposición, reconstrucción temporal y una interfaz de usuario. Algunas operaciones son gráficas; otras, /compute/. Algunas necesitan resultados del fotograma anterior. Y varias compiten por memoria de vídeo.
+
+El problema ya no es únicamente ejecutar un =draw call= deprisa. Es decidir qué operaciones son necesarias, en qué orden deben ejecutarse, cuándo sus datos están disponibles y qué memoria puede reutilizarse sin alterar el resultado.
+
+En 2017, Yuriy O'Donnell describió públicamente la arquitectura FrameGraph de Frostbite en GDC. La idea era que cada módulo declarase qué recursos leía y escribía, mientras una capa común construía y compilaba el grafo del fotograma. El objetivo no era introducir una API gráfica nueva, sino evitar que la complejidad de la coordinación creciera con cada efecto añadido al motor. [[https://www.gdcvault.com/play/1024612/FrameGraph-Extensible-Rendering-Architecture-in][GDC 2017: FrameGraph en Frostbite]].
+
+Este artículo construye el razonamiento desde cero, desarrolla un compilador simplificado en C++23 y termina con la traducción a sincronización Vulkan. Es un tema moderno, pero conecta directamente con el renderizado multipaso de Direct3D 9 y OpenGL.
+
+* Del renderizado inmediato a los pases declarativos
+
+** Cómo se organizaba un renderizador tradicional
+
+Imaginemos una escena con sombras, geometría opaca y postprocesado:
+
+#+begin_src cpp
+render_shadow_map();
+render_gbuffer();
+compute_lighting();
+apply_bloom();
+tone_map();
+present();
+#+end_src
+
+En un motor clásico, cada función puede crear texturas, cambiar estados, insertar barreras y conservar punteros a recursos globales. Funciona hasta que queremos activar y desactivar efectos, cambiar resolución, renderizar varias cámaras o introducir /async compute/.
+
+Por ejemplo, =apply_bloom()= podría necesitar la imagen HDR de iluminación y producir una textura a media resolución. ¿Quién garantiza que la iluminación haya terminado de escribirla? ¿Quién destruye las texturas temporales? ¿Qué ocurre si el bloom se desactiva? ¿Podemos reutilizar su memoria para otra imagen que ya no esté viva?
+
+Con OpenGL, el controlador mantenía gran parte del seguimiento de estados y sincronización implícita; no desaparecían las dependencias, pero muchas decisiones quedaban ocultas. En Vulkan y Direct3D 12, la aplicación debe describirlas con mucha mayor precisión. Un render graph transforma esa obligación en una descripción estructurada que puede analizarse antes de grabar comandos.
+
+** Un grafo no es simplemente una lista
+
+Definimos un conjunto de pases P y recursos R. Cada pase declara un conjunto de lecturas y escrituras. Podemos representar la relación mediante un grafo bipartito: los nodos de pase producen y consumen nodos de recurso. El compilador obtiene después un grafo dirigido de dependencias entre pases.
+
+Ejemplo:
+
+#+begin_example
+Sombras -----> ShadowDepth ------+
+                                 |
+GBuffer -----> Depth, Normals ---+--> Lighting --> HDR
+                                                   |
+                                                   +--> Bloom --> BloomTex
+                                                   |                |
+                                                   +----------------+--> ToneMap --> Swapchain
+#+end_example
+
+Este dibujo es texto, no una imagen externa. La dirección de las flechas expresa una relación productor-consumidor, no necesariamente una orden de ejecución de todas las operaciones.
+
+Si un pase solo necesita =Depth=, no tiene por qué esperar a que termine un pase independiente que produce =ShadowDepth=. El compilador puede identificar independencia; que después exista solapamiento real depende de las colas, la GPU y las restricciones de recursos.
+
+* Modelo formal: lecturas, escrituras y versiones
+
+** Las tres dependencias de memoria
+
+En análisis de dependencias se distinguen tres conflictos sobre una misma ubicación:
+
+- RAW (/read after write/): B lee un valor producido por A; B debe observar la escritura.
+- WAR (/write after read/): B sobrescribe un recurso que A todavía necesita leer.
+- WAW (/write after write/): dos escrituras deben respetar una relación definida para determinar cuál es el resultado válido.
+
+Dos lecturas independientes, en cambio, no necesitan ordenarse entre sí.
+
+Para un recurso r, podemos expresar una dependencia verdadera como:
+
+\[
+ A \rightarrow B \quad \text{si } r \in W(A)\cap R(B).
+\]
+
+La fórmula identifica la relación productor-consumidor, pero no resuelve por sí sola todas las escrituras ni la ambigüedad de versiones. Una implementación robusta debe modelar también WAR y WAW o, preferiblemente, versionar los recursos.
+
+** Versionado: evitar una ambigüedad frecuente
+
+Supongamos que =HDR= se escribe en iluminación, después se modifica por un efecto y finalmente se lee para presentar. Si todos los pases hablan del mismo identificador, el compilador necesita conocer el orden de las escrituras para decidir qué versión lee cada consumidor.
+
+Una alternativa es la semántica tipo SSA (/static single assignment/):
+
+#+begin_example
+Lighting : escribe HDR#0
+Bloom    : lee HDR#0, escribe Bloom#0
+Composite: lee HDR#0 y Bloom#0, escribe HDR#1
+ToneMap  : lee HDR#1, escribe LDR#0
+#+end_example
+
+Cada escritura produce una nueva versión lógica. Una lectura referencia una versión concreta. Así el grafo se vuelve explícito y la compilación puede rechazar lecturas de versiones no producidas.
+
+No significa necesariamente que =HDR#0= y =HDR#1= ocupen dos asignaciones físicas distintas. Esa decisión se toma después, teniendo en cuenta si es seguro escribir en el mismo almacenamiento. La separación entre *identidad lógica* y *memoria física* es una de las ideas centrales del diseño.
+
+** Recursos externos y efectos secundarios
+
+La swapchain, un buffer de lectura hacia CPU, una textura de historial temporal o un recurso persistente no pueden tratarse exactamente como imágenes temporales descartables.
+
+Un pase que escribe una textura que nadie consume dentro del grafo podría parecer inútil, pero quizá la escritura es precisamente el resultado que se presenta en pantalla o que se conserva para el siguiente fotograma. Por eso se marcan recursos importados y pases con efectos secundarios.
+
+En Frostbite, el enfoque declarativo permite eliminar pases cuya salida no contribuye a un resultado observable. La eliminación es correcta únicamente si la descripción declara *todos* los efectos relevantes; un readback o una escritura persistente olvidados pueden hacer que el compilador borre trabajo necesario.
+
+* Construcción y compilación del grafo
+
+** Primera fase: declarar, no ejecutar
+
+Un API mínimo podría distinguir dos callbacks:
+
+#+begin_src cpp
+graph.add_pass(
+    "Lighting",
+    [&](Builder& b) {
+        b.read(shadow_depth);
+        b.read(gbuffer_normal);
+        hdr = b.create_image("HDR", hdr_desc);
+        b.write(hdr);
+    },
+    [&](CommandContext& cmd) {
+        cmd.bind_pipeline(lighting_pipeline);
+        cmd.draw_fullscreen_triangle();
+    });
+#+end_src
+
+El callback de construcción registra metadatos; no crea necesariamente =VkImage= ni graba comandos. El callback de ejecución solo se invoca si el pase sobrevive a la compilación.
+
+En un motor real conviene que el identificador =hdr= devuelto por =write()= represente una nueva versión. En el pseudocódigo anterior se omite ese detalle para mostrar primero la separación entre configuración y ejecución.
+
+** Segunda fase: encontrar lo que realmente se necesita
+
+Partimos de las salidas observables: imagen presentada, recursos exportados y pases con efectos secundarios. Recorremos hacia atrás las dependencias hasta sus productores. Todo pase no alcanzado puede eliminarse si no tiene efectos secundarios.
+
+Ejemplo: el usuario desactiva bloom y =ToneMap= deja de leer =BloomTex=. Si no hay otros consumidores, tanto la composición de bloom como sus etapas intermedias se vuelven inalcanzables. El motor puede evitar no solo sus dispatches, sino también la creación de sus imágenes.
+
+El algoritmo es una búsqueda inversa en el grafo; para V vértices y E aristas, su coste es O(V+E). En la práctica, un fotograma suele tener muchos menos pases que triángulos, por lo que reconstruir el grafo por fotograma puede ser razonable. No obstante, crear miles de objetos temporales, cadenas y tablas hash cada frame sí puede resultar caro.
+
+** Tercera fase: ordenar
+
+Después de podar, aplicamos una ordenación topológica. El algoritmo de Kahn mantiene para cada pase el número de predecesores pendientes. Los nodos con grado de entrada cero están listos; al procesar uno, se decrementa el contador de sus sucesores.
+
+#+begin_src cpp
+#include <cstdint>
+#include <deque>
+#include <stdexcept>
+#include <vector>
+
+std::vector<uint32_t> topological_order(
+    const std::vector<std::vector<uint32_t>>& edges)
+{
+    const auto n = static_cast<uint32_t>(edges.size());
+    std::vector<uint32_t> indegree(n, 0);
+    for (const auto& out : edges)
+        for (uint32_t dst : out)
+            ++indegree.at(dst);
+
+    std::deque<uint32_t> ready;
+    for (uint32_t i = 0; i < n; ++i)
+        if (indegree[i] == 0) ready.push_back(i);
+
+    std::vector<uint32_t> result;
+    result.reserve(n);
+    while (!ready.empty()) {
+        const uint32_t pass = ready.front();
+        ready.pop_front();
+        result.push_back(pass);
+        for (uint32_t dst : edges[pass])
+            if (--indegree[dst] == 0) ready.push_back(dst);
+    }
+    if (result.size() != n)
+        throw std::runtime_error("Render graph contains a cycle");
+    return result;
+}
+#+end_src
+
+Este código es una pieza real y compilable del compilador, pero presupone que =edges= ya contiene las dependencias correctas. No es un render graph completo: no detecta hazards por sí mismo ni implementa versiones de recursos.
+
+Un ciclo indica que las dependencias declaradas son incompatibles. Puede revelar que un pase intenta leer una versión que solo se produce después, o que se han mezclado lecturas y escrituras de una misma imagen sin una semántica clara. No debe solucionarse arbitrariamente intercambiando pases.
+
+* Memoria transitoria: reutilizar sin corromper
+
+** El coste de mantener todos los render targets
+
+Una imagen RGBA16F a 3840 x 2160 ocupa, sin contar alineación ni metadatos:
+
+\[
+3840\cdot2160\cdot8=66\,355\,200\text{ bytes}
+\approx 63.3\text{ MiB}.
+\]
+
+Cinco imágenes de ese tamaño consumen unos 316 MiB, aunque quizás solo dos se necesiten simultáneamente. A esto hay que sumar profundidad, mipmaps, buffers auxiliares, alineaciones y requisitos específicos del dispositivo.
+
+El render graph conoce cuándo se produce y cuándo se consume por última vez cada recurso temporal. En un orden lineal de ejecución, podemos definir su intervalo de vida:
+
+\[
+L(r)=[\operatorname{firstUse}(r),\operatorname{lastUse}(r)].
+\]
+
+Dos recursos con intervalos disjuntos pueden ser candidatos a compartir memoria. Por ejemplo, si =TempA= vive en pases 1 a 3 y =TempB= en pases 5 a 7, no tienen por qué reservar bloques distintos.
+
+** Intervalos, aliasing y compatibilidad
+
+El problema recuerda a la asignación de registros de un compilador. Construimos un grafo de interferencia: dos recursos están conectados si sus vidas se solapan. Asignar memoria es parecido a colorear ese grafo, con restricciones adicionales.
+
+No basta con comparar los intervalos. En Vulkan, compartir una asignación requiere respetar requisitos de memoria, alineación, tamaños, tipos de memoria, compatibilidad de creación y las reglas de aliasing. Además, una transición de aliasing puede exigir sincronización y el contenido previo no debe darse por válido.
+
+Un asignador sencillo puede recorrer recursos ordenados por primer uso, liberar bloques cuyo último uso haya pasado y buscar un bloque compatible suficientemente grande. Este enfoque es aproximado: la mejor colocación global puede requerir una estrategia más sofisticada, y la fragmentación puede reducir las ganancias.
+
+** El peligro de las colas concurrentes
+
+El intervalo =firstUse/lastUse= presupone un calendario lineal. Si compute y graphics se solapan, dos pases alejados en el orden topológico pueden ejecutarse simultáneamente. Reutilizar la memoria entre sus recursos sería incorrecto.
+
+La condición segura es más fuerte: el último acceso al recurso A debe tener una relación de /happens-before/ con el primer acceso a B. Esa relación debe estar garantizada por la planificación y la sincronización real, no solo por el orden en un vector de pases.
+
+Por eso algunos motores asignan primero un calendario conservador, o restringen el aliasing entre colas, antes de intentar optimizaciones agresivas. Una reducción aparente de memoria que introduce carreras no es una optimización.
+
+* De las dependencias lógicas a las barreras Vulkan
+
+** Orden de ejecución no equivale a visibilidad
+
+Este es el punto más delicado. Una barrera puede necesitar dos garantías diferentes:
+
+1. Dependencia de ejecución: ciertas operaciones anteriores terminan antes de que comiencen las posteriores pertinentes.
+2. Dependencia de memoria: las escrituras anteriores se hacen disponibles y visibles para los accesos posteriores.
+
+En Vulkan se describen mediante máscaras de etapas y de acceso. Además, las imágenes tienen /layouts/ que deben ser adecuados a su uso. El compilador del render graph debe convertir la transición entre usos declarados en sincronización concreta. La especificación de Khronos distingue explícitamente estos conceptos. [[https://github.com/KhronosGroup/Vulkan-Docs/blob/main/chapters/synchronization.adoc][Vulkan: Synchronization and Cache Control]].
+
+Consideremos una imagen HDR escrita como color attachment y leída después en un fragment shader:
+
+#+begin_src cpp
+VkImageMemoryBarrier2 barrier{
+    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+    .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+    .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+    .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+    .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    .image = hdr_image,
+    .subresourceRange = {
+        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1
+    }
+};
+VkDependencyInfo dependency{
+    .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+    .imageMemoryBarrierCount = 1,
+    .pImageMemoryBarriers = &barrier
+};
+vkCmdPipelineBarrier2(command_buffer, &dependency);
+#+end_src
+
+Es un ejemplo del caso *misma cola*, una sola mip y una sola capa, con una imagen previamente usada como attachment. Requiere Vulkan 1.3 o la extensión correspondiente, un dispositivo y command buffer válidos y los recursos creados con usos compatibles. No cubre transferencias de propiedad entre familias de colas ni transiciones de presentación.
+
+La barrera está acotada: no necesitamos bloquear todas las etapas de toda la GPU. Una barrera excesivamente amplia puede impedir que el procesado de vértices de un pase se solape con el trabajo de fragmentos de otro.
+
+** Por qué =ALL_COMMANDS= no es una solución elegante
+
+Es tentador generar una barrera global antes y después de cada pase. Suele simplificar el razonamiento inicial, pero puede introducir burbujas en el pipeline.
+
+Un ejemplo oficial de Khronos compara barreras conservadoras y más precisas en un renderizador multipaso. En el escenario medido, afinar la dependencia para permitir solapamiento de etapas mejoró el tiempo de fotograma un 13 %. Es un resultado de *ese ejemplo*, no una mejora universal atribuible a cualquier render graph. [[https://docs.vulkan.org/samples/latest/samples/performance/pipeline_barriers/README.html][Khronos: Using pipeline barriers efficiently]].
+
+El grafo conoce qué recurso cambia de uso y qué etapas lo consumen; esa información permite elegir una sincronización más precisa que una secuencia de barreras genéricas.
+
+** Estados de subrecursos
+
+Una textura no siempre tiene un único estado. Un pase puede escribir el mip 0 y otro leer el mip 3; un array de sombras puede usar capas diferentes. Si el motor sigue estados por imagen completa, insertará barreras innecesarias o prohibirá paralelismo seguro.
+
+Un compilador más avanzado almacena el estado por rango de mips, capas y aspecto. Puede fusionar rangos contiguos con estados iguales para no generar cientos de barreras. La granularidad fina cuesta CPU y memoria de metadatos; la gruesa cuesta oportunidades de paralelismo.
+
+* Un diseño C++23 pequeño pero coherente
+
+** Handles, descriptores y usos
+
+Una implementación útil separa los identificadores lógicos de los objetos Vulkan. Los handles pueden ser índices generacionales para detectar referencias obsoletas. Los recursos describen formato, tamaño y uso, pero no contienen un =VkImage= hasta la fase de asignación.
+
+#+begin_src cpp
+#include <cstdint>
+#include <string>
+#include <vector>
+
+struct ImageHandle {
+    uint32_t id;
+    uint32_t version;
+};
+
+enum class Access {
+    sampled_read,
+    storage_read,
+    storage_write,
+    color_write,
+    depth_write,
+    transfer_read,
+    transfer_write
+};
+
+struct ImageUse {
+    ImageHandle image;
+    Access access;
+};
+
+struct Pass {
+    std::string name;
+    std::vector<ImageUse> uses;
+    bool side_effect = false;
+};
+
+struct Graph {
+    std::vector<Pass> passes;
+};
+#+end_src
+
+Para un prototipo, una versión de imagen puede ser simplemente un entero incrementado en cada escritura. En producción conviene definir explícitamente cómo funcionan las escrituras parciales, las operaciones read-modify-write y los recursos importados.
+
+** Compilación en cuatro pasos
+
+Un compilador didáctico puede seguir este procedimiento:
+
+1. Validar que cada lectura apunta a una versión producida o importada y que no hay múltiples productores de una versión.
+2. Construir las aristas productor-consumidor, marcar salidas observables y podar pases muertos.
+3. Ordenar topológicamente los pases vivos y calcular las vidas de recursos, conservando dependencias de memoria.
+4. Asignar almacenamiento físico compatible y producir un plan de transiciones de estado y barreras.
+
+Conviene guardar un informe de depuración: nombre de cada pase, entradas, salidas, razón por la que se conservó, número de barreras, memoria reservada y recursos que comparten asignación.
+
+Un render graph sin visualización puede resultar más difícil de depurar que el código imperativo que reemplaza. Exportar el grafo a DOT o mostrarlo en una herramienta propia es una inversión práctica.
+
+** Ejemplo de tabla de transición
+
+Una representación intermedia puede convertir usos abstractos en estados:
+
+| Uso lógico | Etapa Vulkan | Acceso Vulkan | Layout |
+|-
+| Color write | COLOR_ATTACHMENT_OUTPUT | COLOR_ATTACHMENT_WRITE | COLOR_ATTACHMENT_OPTIMAL |
+| Sampled read (fragment) | FRAGMENT_SHADER | SHADER_SAMPLED_READ | SHADER_READ_ONLY_OPTIMAL |
+| Storage write (compute) | COMPUTE_SHADER | SHADER_STORAGE_WRITE | GENERAL |
+| Transfer read | COPY | TRANSFER_READ | TRANSFER_SRC_OPTIMAL |
+
+Los nombres de la tabla son abreviaturas de los bits =VK_PIPELINE_STAGE_2_*= y =VK_ACCESS_2_*=; =COPY= requiere compatibilidad con las capacidades de sincronización utilizadas. Un uso abstracto como «sampled read» necesita además saber *en qué etapas* se lee. No basta con el tipo de descriptor para inferirlo siempre.
+
+La transición solo se emite cuando hay una dependencia pertinente, un cambio de layout o una necesidad de sincronización de aliasing. Las lecturas consecutivas compatibles no requieren necesariamente una barrera nueva.
+
+* Async compute: oportunidad y trampa
+
+Una GPU moderna puede disponer de colas de gráficos y compute capaces de progresar simultáneamente. Un render graph puede identificar que una operación de reducción de luminancia y otra de sombras no dependen entre sí.
+
+Pero *independencia lógica* no garantiza *mejora de rendimiento*. Dos tareas pueden competir por unidades de ejecución, caché o ancho de banda. El coste de transferir propiedad de recursos, señalizar semáforos y gestionar timelines puede superar el beneficio.
+
+Para cruzar colas, una planificación correcta necesita dependencias entre submissions, normalmente mediante semáforos; según el recurso y las familias de colas, también puede requerir operaciones de liberación/adquisición de propiedad. Una =vkCmdPipelineBarrier2= dentro de una sola cola no sincroniza mágicamente todas las colas del dispositivo.
+
+La estrategia razonable es comenzar con una única cola, medir el camino crítico y habilitar async compute solo para tareas con suficiente duración y escasa contención. Los semáforos timeline facilitan expresar progreso entre submissions, pero no sustituyen el análisis de hazards ni los requisitos de layout.
+
+* Render graph frente a render pass y API gráfica
+
+Es importante no confundir tres niveles:
+
+- Un *render graph* es una arquitectura de motor que describe dependencias entre trabajos y recursos.
+- Un *render pass* de Vulkan tradicional es un objeto de API con attachments, subpasses y reglas específicas; con dynamic rendering puede no usarse ese objeto.
+- Un *pase* del render graph es una unidad lógica definida por el motor: puede grabar gráficos, compute, transferencias o varias operaciones.
+
+Un render graph puede compilar pases a render passes tradicionales, a dynamic rendering, a dispatches compute o a operaciones de copia. También puede fusionar trabajos compatibles, aunque hacerlo correctamente requiere respetar attachments, cargas, almacenamientos y dependencias.
+
+En Direct3D 12, la traducción equivalente se apoya en estados y barreras de recursos. En Metal, los encoders y las reglas de hazards influyen en el backend. El grafo es una abstracción *por encima* de estas APIs, no un sustituto de sus contratos.
+
+AMD presentó Render Pipeline Shaders (RPS) en diciembre de 2022 como framework de render graphs para APIs explícitas. Su diseño ilustra una evolución desde implementaciones internas de motores hacia bibliotecas especializadas y componibles. [[https://gpuopen.com/learn/rps_1_0/][AMD GPUOpen: Introducing Render Pipeline Shaders SDK]].
+
+* Limitaciones y errores de diseño habituales
+
+** La abstracción no sabe lo que no declaramos
+
+Si un callback escribe un buffer mediante un descriptor oculto y no lo declara, el grafo puede reordenar incorrectamente operaciones. Esto ocurre especialmente con bindless, buffers de argumentos indirectos, punteros GPU y estructuras de aceleración de ray tracing. Las dependencias implícitas de shaders deben convertirse en metadatos explícitos.
+
+** Las texturas históricas rompen el modelo puramente transitorio
+
+TAA, exposición automática y denoisers utilizan datos de fotogramas anteriores. Se importan como recursos persistentes y se intercambian o versionan entre frames. Si hay varios frames en vuelo, también hay que impedir que el frame N+1 sobrescriba un historial todavía usado por N.
+
+** La optimalidad global no es gratuita
+
+Ordenar topológicamente es barato; encontrar simultáneamente la mejor planificación de colas, el menor pico de memoria, la menor cantidad de barreras y la mejor ocupación de GPU es mucho más difícil. Son objetivos que pueden entrar en conflicto.
+
+Un plan que minimiza memoria puede serializar pases que podrían solaparse. Otro que maximiza paralelismo puede requerir más imágenes vivas simultáneamente. Por ello se emplean heurísticas y perfiles reales en lugar de prometer una solución universalmente óptima.
+
+** Un grafo por frame también tiene coste
+
+Construir nodos, resolver versiones, ordenar, calcular vidas y emitir barreras consume CPU. Si el renderizador tiene muy pocos pases, un grafo sofisticado puede no compensar. Algunas implementaciones cachean planes cuando la topología no cambia; otras recompilan por fotograma para facilitar efectos condicionales y cámaras dinámicas.
+
+* Experimento práctico: medir algo más que FPS
+
+Propongo implementar un prototipo con cuatro etapas: G-buffer, iluminación HDR, bloom opcional y tone mapping. Añade un pase artificial que produzca una textura nunca consumida.
+
+Primero ejecuta una versión imperativa, con asignaciones persistentes y barreras conservadoras. Después introduce el grafo sin aliasing. Finalmente activa eliminación de pases muertos y reutilización de memoria.
+
+Mide por separado:
+
+- Tiempo de CPU de construcción y compilación del grafo.
+- Tiempo de CPU de grabación de comandos.
+- Tiempo GPU por pase mediante timestamp queries.
+- Pico de memoria temporal, número de imágenes físicas y número de barreras.
+- Diferencia visual mediante capturas y comparación de imágenes.
+
+Prueba tres resoluciones, desactiva bloom dinámicamente y fuerza varios frames en vuelo. Ejecuta con validation layers de Vulkan y, cuando esté disponible, validación de sincronización. Una ejecución correcta sin mensajes no demuestra por sí sola ausencia de carreras, pero ayuda a detectar errores comunes.
+
+Una prueba especialmente instructiva es mover una barrera desde un alcance conservador hacia etapas y accesos exactos y comprobar si el tiempo GPU cambia. El experimento de Khronos citado anteriormente ofrece un punto de partida reproducible.
+
+* Conclusiones
+
+La evolución de los gráficos en tiempo real no consiste únicamente en añadir unidades más rápidas a la GPU. También exige organizar mejor el trabajo. En los motores de los años noventa, la principal dificultad era conseguir que cada triángulo se dibujase con el menor coste posible. En los motores actuales, además, hay que coordinar docenas o cientos de productores y consumidores de datos sin desperdiciar memoria ni paralelismo.
+
+Un render graph convierte una secuencia implícita de efectos en un contrato explícito: *qué se lee, qué se escribe y qué debe sobrevivir*. A partir de ese contrato podemos eliminar trabajo muerto, ordenar dependencias, reutilizar memoria temporal y generar sincronización específica para Vulkan o Direct3D 12.
+
+La lección más importante es distinguir tres planos: el *grafo lógico* de versiones y dependencias, el *calendario* de ejecución real y la *asignación física* de memoria. Confundirlos produce bugs sutiles. Separarlos permite optimizar cada uno sin perder la corrección.
+
+Para un motor propio en C++23, empezaría con una sola cola, recursos versionados, validación estricta y una visualización DOT. Solo después incorporaría aliasing y async compute. La complejidad adicional merece la pena cuando responde a un problema medido, no porque la técnica esté de moda.
+
+* Fuentes originales y lecturas recomendadas
+
+- Yuriy O'Donnell, [[https://www.gdcvault.com/play/1024612/FrameGraph-Extensible-Rendering-Architecture-in][FrameGraph: Extensible Rendering Architecture in Frostbite]], GDC 2017. Presentación original sobre arquitectura, poda y recursos transitorios.
+- Electronic Arts / DICE, [[https://www.slideshare.net/slideshow/framegraph-extensible-rendering-architecture-in-frostbite/72795495][diapositivas de FrameGraph]], 2017. Material de la charla, útil para estudiar los diagramas originales.
+- Khronos, [[https://github.com/KhronosGroup/Vulkan-Docs/blob/main/chapters/synchronization.adoc][Vulkan Specification: Synchronization and Cache Control]]. Referencia normativa de dependencias de ejecución y memoria.
+- Khronos, [[https://docs.vulkan.org/guide/latest/synchronization_examples.html][Synchronization Examples]]. Casos concretos de barreras, transferencias y semáforos.
+- Khronos, [[https://docs.vulkan.org/samples/latest/samples/performance/pipeline_barriers/README.html][Using pipeline barriers efficiently]]. Ejemplo con medidas y análisis de solapamiento.
+- Zhuo Chen, Florian Herick y Noah Cabral, [[https://gpuopen.com/learn/rps_1_0/][Introducing AMD Render Pipeline Shaders SDK]], GPUOpen, 15 de diciembre de 2022. Arquitectura y motivación de un framework moderno de render graphs.
+
+Las fuentes enlazadas son documentos técnicos y presentaciones originales; no se reproducen imágenes de terceros en este capítulo.
