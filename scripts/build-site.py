@@ -31,8 +31,8 @@ ET.register_namespace("content", CONTENT_NS)
 
 def metadata(path: Path) -> tuple[str, datetime]:
     text = path.read_text(encoding="utf-8")
-    title = re.search(r"^#\\+TITLE:\\s*(.+)$", text, re.M | re.I)
-    date = re.search(r"^#\\+DATE:\\s*<?(\\d{4}-\\d{2}-\\d{2})", text, re.M | re.I)
+    title = re.search(r"^#\+TITLE:\s*(.+)$", text, re.M | re.I)
+    date = re.search(r"^#\+DATE:\s*<?(\d{4}-\d{2}-\d{2})", text, re.M | re.I)
     if not title or not date:
         raise ValueError(f"Missing #+TITLE or #+DATE: {path}")
     dt = datetime.combine(datetime.strptime(date.group(1), "%Y-%m-%d").date(),
@@ -49,7 +49,7 @@ def make_absolute_links(fragment: str, article_url: str) -> str:
         if parsed.scheme or value.startswith("//"):
             return match.group(0)
         return f'{attr}="{escape(urljoin(article_url, value), quote=True)}"'
-    return re.sub(r'\\b(src|href)="([^"]+)"', replace, fragment)
+    return re.sub(r'\b(src|href)="([^"]+)"', replace, fragment)
 
 def build() -> None:
     if SITE.exists():
