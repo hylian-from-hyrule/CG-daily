@@ -9,6 +9,7 @@ on:
       - 'scripts/build-site.py'
       - 'scripts/export-article.el'
       - 'scripts/site.css'
+      - 'scripts/epub.css'
       - '.github/workflows/publish-rss-pages.yml'
   workflow_dispatch:
 
@@ -31,10 +32,10 @@ jobs:
       - name: Checkout del repositorio privado
         uses: actions/checkout@v4
 
-      - name: Instalar Emacs
+      - name: Instalar Emacs y Pandoc
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends emacs-nox
+          sudo apt-get install -y --no-install-recommends emacs-nox pandoc
 
       - name: Construir web pública y feed RSS
         env:
@@ -44,6 +45,7 @@ jobs:
           python3 scripts/build-site.py
           test -s _site/index.html
           test -s _site/feed.xml
+          test "$(find _site/articulos -name '*.epub' | wc -l)" -eq "$(find articulos -name '*.org' | wc -l)"
           test -f _site/.nojekyll
 
       - name: Preparar Pages
