@@ -23,6 +23,10 @@ jobs:
   build:
     name: Exportar HTML y RSS con Emacs
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     steps:
       - name: Checkout del repositorio privado
         uses: actions/checkout@v4
@@ -44,6 +48,8 @@ jobs:
 
       - name: Preparar Pages
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - name: Subir únicamente los archivos públicos
         uses: actions/upload-pages-artifact@v3
