@@ -1,0 +1,332 @@
+#+TITLE: DOOM 1993: BSP, recorte por columnas y visplanes sin Z-buffer
+#+DATE: <2026-11-19 Thu>
+#+LANGUAGE: es
+#+OPTIONS: toc:2 num:t
+#+STARTUP: overview
+#+FILETAGS: :historia:retro:doom:bsp:rasterizacion:
+#+AUTHOR: CG Daily
+
+* Introducción: dibujar menos antes de dibujar más
+
+En diciembre de 1993, DOOM hizo posible recorrer escenarios aparentemente tridimensionales a gran velocidad en ordenadores personales sin aceleración 3D. La solución no fue rasterizar polígonos arbitrarios como haría una GPU moderna, ni calcular la profundidad de cada píxel con un Z-buffer. El motor explotaba restricciones geométricas muy concretas: las paredes eran verticales, los suelos y techos eran horizontales, cada sector tenía alturas constantes y la planta del mapa podía descomponerse previamente mediante un árbol BSP.
+
+Esta elección permite formular una pregunta más interesante que «¿cómo dibujaba DOOM sus paredes?»: ¿cómo podía *evitar* dibujar las paredes que no eran visibles, sin guardar una profundidad para cada píxel? La respuesta combina tres mecanismos que conviene distinguir: un árbol BSP para ordenar la geometría aproximadamente de delante hacia atrás, un recorte horizontal que descarta columnas de paredes ya tapadas y un sistema de *visplanes* que reconstruye los suelos y techos visibles a partir de intervalos verticales.
+
+El código original liberado por id Software permite estudiar la implementación: ~r_bsp.c~ contiene la travesía y el recorte, ~r_segs.c~ prepara las columnas de paredes y sus límites, ~r_plane.c~ agrupa superficies planas y convierte sus contornos en franjas horizontales, y ~r_things.c~ dibuja objetos representados mediante sprites. No se trata de una reconstrucción hipotética: las funciones y estructuras que analizaremos existen en esa implementación. Los fragmentos C++ siguientes son *modelos pedagógicos originales*, no transcripciones literales del código de id Software.
+
+* El problema que imponía el hardware
+
+** Un framebuffer relativamente pequeño no significaba trabajo barato
+
+Un framebuffer de 320 × 200 píxeles contiene 64 000 muestras. En color indexado de ocho bits ocupa 64 KiB; limpiarlo y escribirlo una vez ya consume ancho de banda de memoria. Pero una escena con muchos muros podría tocar un mismo píxel repetidamente. Una técnica de pintor que dibujase de atrás hacia delante sería correcta para superficies bien ordenadas, aunque desperdiciaría trabajo en cada zona tapada.
+
+Un Z-buffer clásico añadiría otro almacenamiento por píxel y comparaciones de profundidad. Con 16 bits por profundidad, 320 × 200 exigiría otros 128 000 bytes; además, habría que inicializarlos y consultarlos. Esta comparación es ilustrativa, no implica que DOOM eligiera su diseño exclusivamente para ahorrar esos 128 KiB. El coste real incluía operaciones enteras, accesos a memoria, cachés y complejidad de geometría. El motor consiguió eliminar gran parte del *overdraw* opaco mediante visibilidad ordenada, algo especialmente valioso en CPU de principios de los noventa.
+
+** Qué es y qué no es el «2,5D» de DOOM
+
+Los sectores tienen un suelo y un techo horizontales, definidos por cotas constantes, una iluminación y referencias a texturas. Las paredes nacen de segmentos del plano XY y se elevan entre esas cotas. Dos sectores contiguos pueden formar una puerta, un escalón o un hueco; una pared de una sola cara cierra completamente la vista. Las coordenadas verticales no son una tercera dimensión libre para la geometría del nivel: no podemos representar dos habitaciones independientes exactamente una encima de otra con el modelo original de sectores.
+
+La cámara sí tiene posición y altura, y la perspectiva de las paredes cambia al moverse. Por tanto, «2,5D» no quiere decir «imagen plana», sino *geometría espacial restringida*. Los sprites de enemigos y objetos son imágenes orientadas hacia la cámara, no mallas poligonales generales.
+
+* Preparación del mapa: construir un BSP fuera del bucle de renderizado
+
+** Particiones y semiplanos
+
+Un segmento dirigido del mapa, con origen A=(a_x,a_y) y dirección d=(d_x,d_y), define una recta. Para un punto P=(p_x,p_y), el determinante
+
+\[
+s(P)=d_x(p_y-a_y)-d_y(p_x-a_x)
+\]
+
+determina en qué lado está: positivo a la izquierda, negativo a la derecha y cero sobre la recta, suponiendo el convenio habitual de coordenadas. No necesitamos calcular una distancia euclídea, que requeriría dividir por la longitud de d; basta el signo.
+
+Un árbol BSP (*binary space partition*) divide recursivamente el conjunto de segmentos con rectas de partición. Si un segmento cruza una recta, se divide en dos. Cada nodo conserva una partición y referencias a sus dos hijos; las hojas son *subsectores* que contienen segmentos ya clasificados. La construcción se efectúa al preparar los datos del nivel, no en cada fotograma.
+
+La elección del plano de partición importa. Si se escoge uno que corta demasiados segmentos, el árbol aumenta el número de fragmentos y empeora la memoria y el recorrido. Si se eligen particiones muy desequilibradas, el árbol se hace profundo. Un criterio simplificado podría penalizar ambas cosas:
+
+\[
+C = \alpha N_{\mathrm{cortes}} + \beta |N_{\mathrm{izq}}-N_{\mathrm{der}}|.
+\]
+
+No es una fórmula oficial del constructor original: es un ejemplo de heurística que muestra el compromiso entre fragmentación y equilibrio.
+
+** Un pequeño recorrido C++23
+
+Podemos representar un BSP simplificado sin clases virtuales, con índices de nodos y hojas. La función siguiente recorre primero el hijo situado del lado del observador, después el otro. No realiza todavía el recorte de oclusión; su único cometido es generar un orden útil para procesar geometría opaca.
+
+#+begin_src cpp
+#include <array>
+#include <cstdint>
+#include <vector>
+
+struct Vec2 { double x, y; };
+
+struct Node {
+    Vec2 origin, direction;
+    int front, back; // negativo: hoja codificada como -1-indice
+};
+
+struct Tree {
+    std::vector<Node> nodes;
+    std::vector<std::vector<int>> leaves; // indices de segmentos
+};
+
+double side(Vec2 p, const Node& n) {
+    const double dx = p.x - n.origin.x;
+    const double dy = p.y - n.origin.y;
+    return n.direction.x * dy - n.direction.y * dx;
+}
+
+template<class Visit>
+void traverse(const Tree& tree, int id, Vec2 eye, Visit&& visit) {
+    if (id < 0) {
+        for (int segment : tree.leaves[static_cast<size_t>(-1-id)])
+            visit(segment);
+        return;
+    }
+    const Node& n = tree.nodes[static_cast<size_t>(id)];
+    const bool on_front = side(eye, n) >= 0.0;
+    traverse(tree, on_front ? n.front : n.back, eye, visit);
+    traverse(tree, on_front ? n.back : n.front, eye, visit);
+}
+#+end_src
+
+En un motor real, la travesía comprueba además si el volumen del hijo lejano puede proyectarse sobre columnas todavía visibles. DOOM conserva cajas delimitadoras para las ramas y utiliza una función de comprobación de visibilidad antes de descender a ciertos hijos. Por tanto, «recorrer el BSP» no equivale a visitar inevitablemente toda la geometría del mapa.
+
+** Orden espacial no significa profundidad perfecta de cada píxel
+
+La división BSP da un orden espacial coherente para los segmentos de la geometría estática, pero los sprites y las paredes con zonas transparentes requieren un tratamiento adicional. Además, el árbol se construye en el plano, no a partir de superficies 3D arbitrarias. Su eficacia depende directamente de las restricciones de los sectores. Ésta es una diferencia fundamental respecto a un BSP genérico de polígonos 3D.
+
+* Proyección: de un segmento del mapa a columnas de pantalla
+
+** Cámara y coordenadas
+
+Tomemos un sistema de cámara con eje Z positivo hacia delante, X horizontal e Y vertical. Un punto del mundo se transforma a coordenadas de cámara (X,Y,Z) mediante traslación y rotación. Para Z>0, la proyección perspectiva ideal es
+
+\[
+x_s=c_x+f_x\frac{X}{Z},\qquad
+y_s=c_y-f_y\frac{Y}{Z}.
+\]
+
+Si el campo de visión horizontal es \(\theta\) y la pantalla tiene ancho W, entonces
+
+\[
+f_x=\frac{W}{2\tan(\theta/2)}.
+\]
+
+Con W=320 y un campo horizontal hipotético de 90 grados, f_x=160 píxeles. Un punto situado a X=2 y Z=8 se proyectaría 40 píxeles a la derecha del centro: x_s=200. El ejemplo no pretende describir exactamente las tablas angulares ni los parámetros de la cámara original.
+
+Para una pared, los dos extremos del segmento determinan un intervalo horizontal de columnas. Las alturas del techo y del suelo se proyectan en los límites verticales de cada columna. En vez de interpolar triángulos arbitrarios, el motor calcula escalas y coordenadas de textura apropiadas para ese muro vertical.
+
+** Recorte contra el plano cercano
+
+Un extremo de pared detrás del observador no debe proyectarse dividiendo por Z negativo o cercano a cero. Primero se recorta el segmento contra el volumen visible. Para un plano cercano Z=n>0 y un segmento P(t)=P_0+t(P_1-P_0), la intersección satisface
+
+\[
+t=\frac{n-Z_0}{Z_1-Z_0}.
+\]
+
+Luego se sustituye el extremo no visible por P(t). En la implementación histórica, las operaciones y los ángulos usan representaciones enteras y tablas precalculadas; no debemos confundir estas ecuaciones conceptuales con una llamada literal a una matriz de proyección moderna.
+
+* Oclusión: una lista de columnas ya ocupadas
+
+** La idea central
+
+Cuando un muro opaco cercano ocupa por completo una columna en el intervalo horizontal de su proyección, ningún muro lejano puede volver a escribir esa columna. En DOOM, ~R_ClipSolidWallSegment~ mantiene intervalos de columnas cerradas por paredes sólidas. Un muro posterior se recorta contra la unión de esos intervalos. Si todo su rango está cubierto, se descarta sin rasterizarlo.
+
+Imaginemos una pantalla de 320 columnas. El primer muro opaco ocupa [80,150]. Otro muro cercano cubre [140,210]. La unión queda [80,210]. Si un muro posterior se proyecta en [100,190], su contribución visible es vacía. Si otro se proyecta en [190,250], sólo interesa [211,250].
+
+Esto es una prueba de oclusión *en el eje horizontal* para muros que cierran completamente la vista. No puede aplicarse de igual forma a una ventana, a un hueco entre suelo y techo o a una pared con textura enmascarada: esas superficies pueden dejar visibles píxeles por encima, debajo o a través.
+
+** Implementación mínima con intervalos
+
+Un modelo moderno puede guardar rangos cerrados ordenados y fusionados. Esta rutina devuelve las partes del intervalo que aún no están cubiertas. Para simplificar, no implementa aquí la inserción posterior; el algoritmo de unión debe mantener los rangos ordenados, sin solapamientos y fusionando también los adyacentes.
+
+#+begin_src cpp
+#include <algorithm>
+#include <utility>
+#include <vector>
+
+using Range = std::pair<int, int>; // extremos inclusivos
+
+std::vector<Range> uncovered(
+    Range incoming, const std::vector<Range>& covered)
+{
+    std::vector<Range> visible;
+    int cursor = incoming.first;
+
+    for (const auto& [a, b] : covered) {
+        if (b < cursor) continue;
+        if (a > incoming.second) break;
+        if (a > cursor)
+            visible.emplace_back(cursor, std::min(a - 1, incoming.second));
+        cursor = std::max(cursor, b + 1);
+        if (cursor > incoming.second) break;
+    }
+    if (cursor <= incoming.second)
+        visible.emplace_back(cursor, incoming.second);
+    return visible;
+}
+#+end_src
+
+La versión original emplea una lista de rangos con centinelas y la modifica durante el recorrido. El objetivo no es introducir un Z-buffer disfrazado: cada intervalo almacena sólo dos coordenadas X, no una profundidad por píxel.
+
+** Muros con dos caras y recorte vertical
+
+Si el sector de detrás tiene un techo más alto o un suelo más bajo, la pared no cierra necesariamente toda la columna. El renderizador debe conservar los límites verticales de lo que todavía se puede ver. Dos arreglos, ~ceilingclip[x]~ y ~floorclip[x]~, delimitan las regiones disponibles para dibujar techo y suelo. Los segmentos de pared actualizan esos límites mientras se procesan.
+
+El motor distingue paredes superiores, inferiores y medias; el tratamiento depende de las alturas relativas y de las texturas del sector frontal y posterior. Así puede mostrar, por ejemplo, una abertura que revela una habitación posterior sin dibujar todos los píxeles tapados por la parte inferior del muro.
+
+* Visplanes: los suelos no se dibujan como las paredes
+
+** Por qué no bastan las columnas
+
+Una pared vertical se beneficia de un bucle que avanza por Y en una columna: la coordenada horizontal de textura permanece asociada a esa columna, mientras la vertical cambia. Un suelo horizontal es diferente. Para un píxel de pantalla situado a cierta fila Y, todos los puntos de esa fila sobre un plano horizontal tienen una relación de profundidad común; resulta más natural recorrer una *franja horizontal*.
+
+DOOM registra las zonas de suelo y techo que quedan visibles tras dibujar las paredes y las agrupa en estructuras llamadas *visplanes*. Una visplane no es un polígono 3D explícito: identifica una altura, una textura y un nivel de luz, además de un contorno por columnas. Los campos ~top[x]~ y ~bottom[x]~ indican qué intervalo vertical pertenece a ese plano en la columna x.
+
+** Cuándo pueden fusionarse dos regiones
+
+~R_FindPlane~ busca un plano con la misma altura, textura e iluminación. Para el cielo, normaliza determinados atributos porque varias regiones de cielo pueden compartir representación. Pero compartir esos tres atributos no garantiza que dos fragmentos se puedan representar con un único contorno por columna. ~R_CheckPlane~ examina si sus intervalos horizontales entran en conflicto con columnas ya utilizadas y, cuando hace falta, divide la representación en otra visplane.
+
+Esta distinción explica por qué contar «texturas diferentes» no basta para estimar el número de visplanes: dos regiones con idéntica textura y altura pueden exigir registros distintos si su ocupación de columnas se solapa de una manera incompatible.
+
+** De un contorno por columnas a franjas horizontales
+
+Supongamos que una región visible ocupa, para cada columna x, el intervalo de filas [top[x],bottom[x]]. Queremos emitir spans [x_inicio,x_fin] para cada fila y. Una estrategia ingenua sería recorrer cada fila y buscar secuencias de columnas cubiertas; cuesta O(W·H) para cada plano.
+
+DOOM emplea ~R_MakeSpans~: compara los intervalos verticales de dos columnas consecutivas. Las filas que estaban abiertas y dejan de estarlo producen un span; las que aparecen ahora registran su columna de inicio. Al final se introduce una columna centinela vacía para cerrar las franjas pendientes. Esto convierte una representación conveniente para el recorte de paredes en otra conveniente para mapear texturas de suelo.
+
+Ejemplo: si en x=20 el plano cubre filas 100..130 y en x=21 cubre 105..125, los spans correspondientes a las filas 100..104 y 126..130 terminan en x=20. Las filas 105..125 siguen abiertas. El mecanismo funciona aunque el contorno cambie de manera irregular entre columnas.
+
+* Matemáticas del suelo: por qué una fila tiene una profundidad
+
+** Intersección del rayo con un plano horizontal
+
+Situemos la cámara a altura h sobre el suelo, mirando horizontalmente. La coordenada vertical de pantalla y se mide desde el centro c_y hacia abajo. Para un punto del suelo a profundidad Z, su coordenada vertical relativa a la cámara es Y=-h. La ecuación de proyección da
+
+\[
+y-c_y=f_y\frac{h}{Z}.
+\]
+
+Despejando:
+
+\[
+Z(y)=\frac{f_yh}{y-c_y}.
+\]
+
+En un ejemplo con f_y=160, h=48 unidades y una fila 40 píxeles bajo el horizonte, Z=192 unidades. Si la fila está sólo 10 píxeles por debajo, Z=768. La distancia crece rápidamente cerca del horizonte; en el horizonte ideal el denominador se anula. Por eso el cálculo debe tratar cuidadosamente las filas próximas a esa línea.
+
+Este desarrollo supone cámara sin inclinación, suelo horizontal y coordenadas de cámara simples. DOOM original se beneficia precisamente de esa restricción. Con cabeceo libre o suelos inclinados, el cálculo y la organización de las superficies deben generalizarse.
+
+** Incrementos de textura sobre una fila
+
+Para una fila fija, Z(y) es constante en la cámara ideal. La coordenada horizontal del punto visible se obtiene a partir de la proyección:
+
+\[
+X(x,y)=\frac{(x-c_x)Z(y)}{f_x}.
+\]
+
+Por tanto, al incrementar x en una unidad, X cambia una cantidad constante:
+
+\[
+\Delta X=\frac{Z(y)}{f_x}.
+\]
+
+Después de rotar el vector (X,Z) al sistema del mundo, las coordenadas del suelo (u,v) cambian también por incrementos constantes en cada píxel de la franja. Esto permite calcular una posición inicial y luego sumar ~du~ y ~dv~ en el bucle interno, en lugar de dividir para cada muestra.
+
+#+begin_src cpp
+#include <cstdint>
+#include <vector>
+
+struct Flat64 {
+    const std::uint8_t* texels; // textura 64 x 64 indexada
+};
+
+void draw_span(
+    std::uint8_t* row, int x0, int x1,
+    std::int64_t u, std::int64_t v,
+    std::int64_t du, std::int64_t dv,
+    Flat64 flat)
+{
+    // Formato pedagógico 16.16: parte entera en bits superiores.
+    for (int x = x0; x <= x1; ++x) {
+        const int tx = static_cast<int>((u >> 16) & 63);
+        const int ty = static_cast<int>((v >> 16) & 63);
+        row[x] = flat.texels[ty * 64 + tx];
+        u += du;
+        v += dv;
+    }
+}
+#+end_src
+
+Esta rutina presupone textura de 64 × 64 y coordenadas que pueden envolver con máscara. Para reproducir exactamente el comportamiento visual de DOOM habría que incorporar el formato de almacenamiento, las tablas de iluminación ~COLORMAP~, los pasos y escalas originales y el formato de precisión empleado por cada función. No conviene interpretar el ejemplo como sustituto compatible con ~R_DrawSpan~.
+
+** Iluminación y color indexado
+
+En lugar de calcular un modelo de iluminación por píxel con vectores normales, el motor usa índices de paleta y tablas de conversión. Un nivel de luz y una distancia seleccionan una tabla de colores, que transforma el índice de textura en un índice de pantalla. El resultado reproduce bandas de atenuación y contrastes característicos, sin multiplicaciones RGB por píxel.
+
+Esta arquitectura está íntimamente relacionada con el presupuesto computacional: una lectura de texel, una consulta a tabla y una escritura pueden sustituir a operaciones de iluminación mucho más generales. A cambio, el color y las transiciones de luminosidad están cuantizados.
+
+* El famoso límite de 128 visplanes
+
+En el código original de ~r_plane.c~ aparece ~MAXVISPLANES 128~. ~R_FindPlane~ provoca un error si intenta crear más registros que los disponibles. Es importante formular bien el límite: no son «128 suelos en el mapa», ni «128 texturas», sino hasta 128 estructuras de visplane simultáneas en la representación de un fotograma, incluyendo las divisiones necesarias por conflictos de contorno.
+
+Un diseñador podía construir una escena con muchos cambios de altura, texturas e iluminación que obligara a dividir visplanes y terminara en un *visplane overflow*. El resultado no era simplemente una bajada de FPS: el motor original podía abortar con error. Otros límites estáticos afectaban a los segmentos dibujados y a las aperturas almacenadas.
+
+¿Por qué no ampliar sin más el arreglo? En una implementación posterior es posible, y muchos ports eliminaron estas restricciones. Pero en 1993 los límites fijos simplificaban la gestión de memoria, evitaban asignaciones dinámicas en zonas calientes y daban costes previsibles. El precio era trasladar parte de la complejidad al diseño de mapas y a sus herramientas de validación.
+
+* Comparación con alternativas históricas y modernas
+
+** BSP y oclusión frente a Z-buffer
+
+Un rasterizador con Z-buffer puede dibujar triángulos en orden casi arbitrario y resolver la visibilidad por muestra. Su ventaja es la generalidad: admite paredes inclinadas, superficies superpuestas, geometría dinámica y cámaras con orientación libre. Su desventaja es que necesita almacenar y consultar profundidad, además de que el trabajo de sombreado puede repetirse si no hay técnicas adicionales de eliminación de superficies ocultas.
+
+El enfoque de DOOM descarta regiones opacas enteras antes de rasterizarlas y evita un buffer de profundidad. Es eficiente para sus restricciones geométricas, pero no se generaliza limpiamente a cualquier escena 3D. La lección no es que «BSP sea mejor que Z-buffer», sino que un modelo de mundo restringido permite una solución especializada muy competitiva.
+
+** DOOM frente a un raycaster de rejilla
+
+Un raycaster tipo Wolfenstein 3D puede lanzar un rayo por columna y avanzar sobre una cuadrícula hasta encontrar una pared. Es muy sencillo cuando las paredes siguen celdas ortogonales y tienen alturas uniformes. DOOM permite segmentos de pared con orientaciones arbitrarias en planta y sectores con cotas diferentes, y utiliza partición BSP y recorte de segmentos para ordenar lo visible.
+
+No debe confundirse tampoco con el ray tracing actual: el recorrido BSP de DOOM sirve principalmente para ordenar segmentos estáticos del mapa; no calcula un rayo de reflexión o iluminación por píxel.
+
+** Qué reutilizaríamos hoy
+
+Para un juego moderno deliberadamente retro, hay dos caminos razonables. Uno es reconstruir un renderizador software de columnas y spans, con precisión entera, paleta y tablas, para aprender y reproducir sus restricciones. Otro es conservar la representación por sectores y BSP, pero enviar los segmentos visibles a una GPU mediante Vulkan, Metal, OpenGL o WebGPU.
+
+En el segundo caso, el BSP puede seguir siendo una estructura de visibilidad a nivel de mundo, pero el Z-buffer de la GPU resuelve la oclusión final. La transferencia de miles de pequeños comandos individuales puede anular la ventaja del recorte en CPU; conviene agrupar geometría y medir el coste de los *draw calls*. Si el nivel cambia dinámicamente, reconstruir o actualizar el BSP también tiene un coste que no aparece en el escenario estático original.
+
+* Experimento reproducible: construir un pequeño renderizador
+
+Propongo implementar el sistema en cuatro etapas, registrando contadores antes de optimizar.
+
+1. Cargar una planta formada por segmentos y sectores, construir un BSP offline y mostrar el orden de visita desde distintas posiciones. Registrar número de nodos, segmentos fragmentados y profundidad máxima.
+2. Proyectar segmentos y dibujar paredes opacas como columnas. Añadir un contador de píxeles escritos por fotograma y otro de columnas descartadas. Comparar un modo sin recorte con el recorte por intervalos.
+3. Incorporar sectores con aperturas, ~floorclip~ y ~ceilingclip~. Registrar por columna los intervalos que quedan libres y visualizar esos límites con colores de depuración.
+4. Registrar visplanes, convertirlos en spans y mapear un suelo de 64 × 64 mediante incrementos 16.16. Contar visplanes y spans, y probar deliberadamente una escena con muchos cambios de altura e iluminación.
+
+La comparación justa no consiste únicamente en medir FPS. Conviene medir el número de píxeles efectivamente escritos, la cantidad de segmentos procesados, el número de visplanes, los accesos de textura y el tiempo de CPU por fase. Una variante con Z-buffer software debe utilizar la misma resolución y una rasterización comparable, de lo contrario la conclusión estará dominada por diferencias de implementación.
+
+** Detalles de robustez
+
+En un prototipo C++ moderno, conviene evitar la aritmética entera con overflow indefinido en productos de coordenadas; usar ~int64_t~ para determinantes de coordenadas de 32 bits o ~double~ si no se exige reproducir los redondeos históricos. Los desplazamientos de enteros negativos en ejemplos de punto fijo requieren atención a portabilidad y representación. Los rangos de columnas deben recortarse a [0,W-1] antes de indexar arrays.
+
+También hay que distinguir dos fenómenos: los errores numéricos que producen pequeñas grietas entre paredes y los errores topológicos en la construcción del BSP que generan segmentos mal conectados. Una prueba con cámara justo sobre la recta de partición es útil para comprobar el convenio de lados y el tratamiento de empates.
+
+* Conclusión: un motor construido alrededor de sus restricciones
+
+DOOM no era un rasterizador 3D general que casualmente funcionara rápido. Era un sistema cuidadosamente especializado: el mapa preprocesado producía un orden de visibilidad, las paredes opacas cerraban intervalos de columnas, los sectores abiertos mantenían límites verticales y los visplanes convertían los contornos del suelo en franjas horizontales baratas de texturizar.
+
+La combinación explica tanto su velocidad como sus límites: geometría 2,5D, representación por sectores, ausencia de Z-buffer general, dificultades con superficies transparentes y estructuras de tamaño fijo. La enseñanza sigue siendo relevante para cualquier motor gráfico: el mejor algoritmo de visibilidad depende de qué geometría prometemos admitir, de cuándo podemos preprocesarla y de dónde se encuentra realmente el coste —CPU, memoria o GPU—. Entender esas condiciones es más útil que copiar un algoritmo fuera de su contexto.
+
+* Fuentes primarias y lecturas para continuar
+
+- [[https://github.com/id-Software/DOOM/blob/master/linuxdoom-1.10/r_bsp.c][id Software, DOOM: r_bsp.c]]. Código fuente original liberado, travesía BSP, recorte de segmentos y pruebas de cajas.
+- [[https://github.com/id-Software/DOOM/blob/master/linuxdoom-1.10/r_segs.c][id Software, DOOM: r_segs.c]]. Renderizado de paredes, recorte vertical y preparación de columnas.
+- [[https://github.com/id-Software/DOOM/blob/master/linuxdoom-1.10/r_plane.c][id Software, DOOM: r_plane.c]]. Definición de ~MAXVISPLANES~, ~R_FindPlane~, ~R_CheckPlane~, ~R_MakeSpans~ y ~R_MapPlane~.
+- [[https://github.com/id-Software/DOOM/blob/master/linuxdoom-1.10/r_main.c][id Software, DOOM: r_main.c]]. Preparación del punto de vista y funciones geométricas del renderizador.
+- [[https://github.com/id-Software/DOOM/blob/master/linuxdoom-1.10/r_things.c][id Software, DOOM: r_things.c]]. Sprites y objetos, que requieren tratamiento distinto de las paredes opacas.
+- [[https://github.com/id-Software/DOOM/blob/master/linuxdoom-1.10/p_sight.c][id Software, DOOM: p_sight.c]]. Comprobación de línea de visión para lógica del juego; no confundir con la oclusión de columnas del renderizador.
+- [[https://doomwiki.org/wiki/Visplane_overflow][DoomWiki: Visplane overflow]]. Referencia comunitaria secundaria para las consecuencias prácticas del límite y los cambios en source ports.
+
+Nota de procedencia: las fuentes de id Software son código primario de la versión Linux DOOM 1.10 publicada posteriormente al lanzamiento original; permiten verificar la arquitectura, pero no deben confundirse con una instantánea exacta del ejecutable comercial de diciembre de 1993. Los ejemplos y ecuaciones simplificadas de este capítulo son elaboración didáctica propia y no se presentan como citas literales.
