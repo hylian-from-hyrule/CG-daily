@@ -4,6 +4,7 @@
 
 * 2026
 ** Noviembre
+- <2026-11-20 Fri> [[file:articulos/2026/11/2026-11-20-bindless-descriptor-indexing.org][Bindless y descriptor indexing: cómo alimentar una GPU con millones de materiales]] :moderno:gpu:vulkan:bindless:
 - <2026-11-19 Thu> [[file:articulos/2026/11/2026-11-19-doom-bsp-visplanes-occlusion.org][DOOM 1993: BSP, recorte por columnas y visplanes sin Z-buffer]] :historia:retro:doom:bsp:
 - <2026-11-18 Wed> [[file:articulos/2026/11/2026-11-18-render-graphs-sincronizacion-recursos.org][Render graphs: dependencias, barreras y memoria transitoria en una GPU moderna]] :moderno:gpu:vulkan:render-graph:
 - <2026-11-17 Tue> [[file:articulos/2026/11/2026-11-17-voodoo-glide-pipeline-pixel.org][3dfx Voodoo y Glide: anatomía de una tubería de píxeles de 1996]] :historia:retro:3dfx:glide:
