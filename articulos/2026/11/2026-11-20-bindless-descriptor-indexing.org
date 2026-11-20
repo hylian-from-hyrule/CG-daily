@@ -1,0 +1,436 @@
+#+TITLE: Bindless y descriptor indexing: cómo alimentar una GPU con millones de materiales
+#+DATE: <2026-11-20 Fri>
+#+LANGUAGE: es
+#+OPTIONS: toc:3 num:t
+#+STARTUP: overview
+#+FILETAGS: :moderno:gpu:vulkan:bindless:materiales:
+
+* De los registros de textura a los mundos con miles de materiales
+
+En los años noventa, un renderizador podía asociar una textura al estado de la API, dibujar un conjunto de triángulos y cambiar de textura antes del siguiente objeto. OpenGL exponía esta idea mediante =glBindTexture=; Direct3D 9 organizaba recursos en etapas de textura y registros de sombreadores. Era una interfaz natural para escenas relativamente pequeñas: el programa decía qué dibujar y con qué recursos, y el controlador traducía las órdenes.
+
+Conforme crecieron los mundos abiertos, los materiales, los efectos y el número de objetos, ese patrón empezó a tener un coste visible. Un bosque con miles de árboles no necesita necesariamente miles de geometrías distintas, pero sí puede combinar centenares de variaciones de hojas, cortezas, normales, rugosidades y máscaras. Además, un motor moderno suele construir listas de dibujo en varios hilos y ejecutar trabajo generado por la propia GPU.
+
+Una solución fue agrupar objetos por material y reducir los cambios de estado. Otra, la de este artículo, consiste en permitir que los sombreadores seleccionen recursos desde tablas grandes de descriptores, usando índices almacenados en datos de escena. Es la familia de técnicas conocida como /bindless rendering/. No significa literalmente que no exista ninguna vinculación: significa que evitamos enlazar individualmente cada textura antes de cada dibujo.
+
+El recorrido histórico tiene varias etapas. OpenGL ofreció extensiones como =ARB_bindless_texture=; Direct3D 12 introdujo montones de descriptores visibles para la GPU y tablas de descriptores; Vulkan 1.2 incorporó las capacidades de =VK_EXT_descriptor_indexing= al núcleo. El interés de 2016 en adelante creció especialmente al combinar estas capacidades con /GPU-driven rendering/, culling computacional y comandos indirectos.
+
+* El problema: demasiados cambios de estado
+
+** Un renderizador tradicional
+
+Imaginemos 20 000 objetos visibles y 1 500 materiales. Un esquema simplificado podría ser:
+
+#+begin_src cpp
+for (const Draw& draw : visibleDraws) {
+    bindPipeline(draw.pipeline);
+    bindMaterialTextures(draw.material);
+    bindVertexBuffers(draw.mesh);
+    drawIndexed(draw.indexCount);
+}
+#+end_src
+
+Si =bindMaterialTextures= requiere actualizar descriptores o cambiar conjuntos de descriptores, el procesador y el controlador realizan trabajo por cada cambio. Aunque muchas APIs permiten preconstruir conjuntos, todavía debemos organizar el orden de las llamadas y gestionar un gran número de combinaciones.
+
+Agrupar por material reduce los cambios, pero entra en conflicto con otros objetivos. Por ejemplo, ordenar de delante hacia atrás mejora el rechazo temprano de profundidad; agrupar por pipeline reduce cambios de estado; agrupar por transparencia exige ordenación de atrás hacia delante. No hay un orden único que optimice todas las cosas.
+
+El problema empeora con el renderizado dirigido por GPU: un shader de cómputo puede decidir qué objetos son visibles, pero no puede invocar arbitrariamente desde su interior una llamada de CPU para enlazar la textura del siguiente objeto.
+
+** Descriptores, recursos y direcciones
+
+Conviene separar tres conceptos:
+
+- El /recurso/ es la imagen, buffer o sampler almacenado en memoria y administrado por la API.
+- El /descriptor/ codifica cómo accede un shader a ese recurso: vista, formato, rango o estado del sampler, según el tipo.
+- El /índice/ es un entero que identifica una posición dentro de una tabla de descriptores.
+
+Un descriptor no es simplemente un puntero C++ al objeto de la API. Su representación es específica del dispositivo y la API, y puede contener información que no aparece en una dirección virtual.
+
+Con bindless, el motor puede asignar a cada textura un identificador entero estable mientras dure su residencia:
+
+#+begin_src cpp
+struct MaterialGPU {
+    uint32_t albedoTexture;
+    uint32_t normalTexture;
+    uint32_t ormTexture;  // oclusión, rugosidad, metalicidad
+    uint32_t flags;
+};
+#+end_src
+
+Los materiales pasan a ser datos normales de GPU, almacenados en un =StorageBuffer=, en lugar de requerir un nuevo enlace de recursos para cada dibujo.
+
+* Una tabla global de texturas
+
+** Indirección en dos niveles
+
+Supongamos que un objeto tiene un =materialId= y que cada material contiene índices de textura. La ruta lógica es:
+
+#+begin_src text
+objeto -> materialId -> MaterialGPU -> textureIndex -> descriptor -> imagen
+#+end_src
+
+Una tabla de 8 192 texturas no obliga a utilizar 8 192 texturas en un mismo fragmento: solamente ofrece un espacio de nombres grande. El shader accede a las pocas que necesita para el material actual.
+
+En GLSL para Vulkan, la idea se expresa así:
+
+#+begin_src glsl
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(set = 0, binding = 0) uniform sampler2D textures[];
+
+struct Material {
+    uint albedoTexture;
+    uint normalTexture;
+    uint ormTexture;
+    uint flags;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer Materials {
+    Material materials[];
+};
+
+layout(location = 0) flat in uint materialId;
+layout(location = 1) in vec2 uv;
+layout(location = 0) out vec4 outColor;
+
+void main() {
+    uint index = materials[materialId].albedoTexture;
+    vec4 albedo = texture(textures[nonuniformEXT(index)], uv);
+    outColor = albedo;
+}
+#+end_src
+
+Este ejemplo muestra la organización de recursos, no un shader PBR completo. Los detalles de interpolación de =materialId= dependen de cómo se entregue el identificador desde la etapa anterior.
+
+** ¿Por qué =nonuniformEXT= es importante?
+
+Una GPU ejecuta fragmentos en grupos de invocaciones, habitualmente llamados /waves/ o /warps/. Una expresión uniforme tiene el mismo valor para las invocaciones pertinentes del grupo; una no uniforme puede variar entre ellas.
+
+Consideremos cuatro fragmentos que ejecutan una instrucción de muestreo:
+
+#+begin_src text
+lane:             0    1    2    3
+textureIndex:     7    7   42   19
+#+end_src
+
+Si el compilador supone que el índice es uniforme cuando realmente no lo es, puede generar una ruta incorrecta para seleccionar el descriptor. =nonuniformEXT= comunica explícitamente esa propiedad. No es una sugerencia de optimización: cuando la expresión es no uniforme y el acceso lo requiere, la anotación es parte de la corrección del programa.
+
+La divergencia también tiene consecuencias de rendimiento. Si cada lane accede a una textura distinta, las peticiones pueden dispersarse entre regiones de memoria y reducir la localidad de caché. Bindless elimina muchos cambios de estado de CPU, pero no elimina el coste de acceso a memoria ni garantiza que un shader divergente sea rápido.
+
+* Vulkan: descriptor indexing paso a paso
+
+** Capacidades y límites
+
+Vulkan distingue varias capacidades relacionadas, entre ellas =runtimeDescriptorArray=, =shaderSampledImageArrayNonUniformIndexing=, =descriptorBindingPartiallyBound= y =descriptorBindingVariableDescriptorCount=. No todas son necesarias para todos los diseños; debemos consultar las características del dispositivo y habilitar solamente las que utilicemos.
+
+En Vulkan 1.2 pueden consultarse mediante =VkPhysicalDeviceVulkan12Features= encadenada a =VkPhysicalDeviceFeatures2=. En una aplicación real también es necesario consultar límites, incluidos los de descriptores por etapa y por conjunto, y comprobar las capacidades de actualización de descriptores.
+
+#+begin_src cpp
+VkPhysicalDeviceVulkan12Features v12{
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+};
+VkPhysicalDeviceFeatures2 features{
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2
+};
+features.pNext = &v12;
+vkGetPhysicalDeviceFeatures2(physicalDevice, &features);
+
+if (!v12.runtimeDescriptorArray ||
+    !v12.shaderSampledImageArrayNonUniformIndexing) {
+    throw std::runtime_error("Descriptor indexing no compatible");
+}
+#+end_src
+
+La consulta no activa las características: deben incluirse en la cadena =pNext= al crear =VkDevice=, con los campos seleccionados establecidos a =VK_TRUE=. Tampoco basta con que el hardware soporte Vulkan 1.2: las capacidades concretas pueden variar.
+
+** Construcción del layout
+
+Un descriptor set layout describe el tipo de los recursos y cuántos descriptores puede contener cada binding. Para un array de imágenes combinadas con sampler:
+
+#+begin_src cpp
+constexpr uint32_t MaxTextures = 8192;
+
+VkDescriptorSetLayoutBinding binding{};
+binding.binding = 0;
+binding.descriptorType =
+    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+binding.descriptorCount = MaxTextures;
+binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+VkDescriptorBindingFlags flags =
+    VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+    VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+
+VkDescriptorSetLayoutBindingFlagsCreateInfo flagInfo{
+    VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO
+};
+flagInfo.bindingCount = 1;
+flagInfo.pBindingFlags = &flags;
+
+VkDescriptorSetLayoutCreateInfo layoutInfo{
+    VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+};
+layoutInfo.pNext = &flagInfo;
+layoutInfo.bindingCount = 1;
+layoutInfo.pBindings = &binding;
+#+end_src
+
+Este fragmento configura únicamente el binding de texturas: para el ejemplo GLSL anterior habría que añadir el binding 1 del buffer de materiales. Además, Vulkan exige que el binding de cantidad variable sea el de número más alto del conjunto. Por tanto, si usamos ambos bindings en un mismo set, debemos colocar el array variable al final (por ejemplo, materiales en binding 0 y texturas en binding 1), o separar las tablas en distintos sets. La declaración GLSL y el layout de la aplicación deben coincidir.
+
+Es un detalle fácil de pasar por alto: el fragmento ilustra las banderas, no constituye por sí solo una configuración completa y válida del shader mostrado.
+
+=PARTIALLY_BOUND= permite que no todos los elementos estén poblados, sujeto a las reglas de acceso y validez. No autoriza a leer descriptores no inicializados. Una práctica robusta consiste en reservar el índice cero para una textura de sustitución: blanco, negro o magenta de error.
+
+** Cantidad variable y actualizaciones
+
+Con =VARIABLE_DESCRIPTOR_COUNT= se reserva un máximo en el layout y se indica el número efectivo al asignar el conjunto. El binding variable debe ser el último por número de binding. Si usamos 8 192 como máximo y solamente 2 000 como cantidad efectiva, los índices accesibles deben permanecer dentro de esos 2 000 elementos.
+
+=UPDATE_AFTER_BIND= es otra capacidad, independiente, que permite ciertos cambios después de enlazar un descriptor set, con banderas, límites y reglas de sincronización específicos. No debe confundirse con una autorización general para modificar recursos mientras la GPU los utiliza. Un descriptor todavía leído por un comando en vuelo puede requerir gestión de generaciones, recursos por frame o una política explícita de retirada.
+
+* Matemáticas del coste: CPU, memoria y localidad
+
+** Modelo simplificado del coste de CPU
+
+Sea N el número de dibujos, M el número de cambios de material, C_d el coste de emitir un dibujo, C_b el coste de cambiar los descriptores y C_u el coste de subir datos.
+
+Un modelo tradicional aproximado sería:
+
+\[
+T_{\mathrm{CPU}} \approx N C_d + M C_b + C_u.
+\]
+
+Con un conjunto global y material IDs en buffers:
+
+\[
+T_{\mathrm{CPU,bindless}} \approx N C_d + K C_b + C'_u,
+\]
+
+donde K suele ser pequeño respecto a M. Pero si N sigue siendo muy grande, el término de dibujos continúa dominando. Para reducirlo también necesitamos instancing, multidraw indirect o una estrategia GPU-driven.
+
+Por ejemplo, con 20 000 dibujos y 6 000 cambios de material, suponiendo de forma puramente ilustrativa =C_d= de 0,5 microsegundos y =C_b= de 0,8 microsegundos:
+
+\[
+T \approx 20\,000(0{,}5) + 6\,000(0{,}8)
+= 14\,800\ \mu s.
+\]
+
+Si el coste de cambios se redujera a 50 operaciones equivalentes:
+
+\[
+T' \approx 20\,000(0{,}5)+50(0{,}8)
+=10\,040\ \mu s.
+\]
+
+No son medidas reales de Vulkan ni predicciones de una GPU concreta. El cálculo demuestra por qué el ahorro de cambios no resuelve automáticamente la sobrecarga de 20 000 llamadas de dibujo.
+
+** Coste de memoria de las tablas
+
+Si cada material contiene tres índices de 32 bits y un campo de banderas de 32 bits, ocupa 16 bytes. Para 100 000 materiales:
+
+\[
+100\,000 \times 16 = 1\,600\,000\ \text{bytes}
+\approx 1{,}53\ \text{MiB}.
+\]
+
+Es una cantidad pequeña comparada con las texturas. Pero no debemos inferir de ello que una tabla de 100 000 descriptores sea gratuita: cada descriptor ocupa espacio dependiente de la implementación y los límites del dispositivo pueden impedir esa cantidad.
+
+** Localidad y coherencia
+
+Dos triángulos vecinos que consultan la misma textura tienden a reutilizar líneas de caché. Si cada píxel selecciona aleatoriamente una textura distinta, se pierde esa localidad. Por ello un motor bindless todavía puede ordenar objetos por pipeline, profundidad o material cuando sea rentable.
+
+La ventaja esencial no es eliminar la organización de la escena, sino separar la selección de recursos de la emisión de comandos de CPU.
+
+* Un ejemplo práctico de gestor de texturas
+
+** Identificadores y reutilización
+
+Nunca conviene entregar directamente al contenido del juego un índice que pueda reutilizarse sin control. Si una textura desaparece y su slot se asigna a otra, un material antiguo podría mostrar accidentalmente el recurso nuevo.
+
+Podemos empaquetar índice y generación:
+
+#+begin_src cpp
+#include <cstdint>
+
+struct TextureHandle {
+    uint32_t slot;
+    uint32_t generation;
+};
+
+struct TextureSlot {
+    uint32_t generation = 1;
+    bool occupied = false;
+};
+
+bool valid(TextureHandle h, const TextureSlot& s) {
+    return s.occupied && h.generation == s.generation;
+}
+#+end_src
+
+Cuando liberamos el slot, incrementamos la generación. La CPU valida los handles antes de escribir índices a buffers GPU. El shader puede usar solamente el slot; la validación y la política de vida útil deben haberse resuelto antes de enviar los datos.
+
+La retirada física de una textura no puede ocurrir mientras queden comandos en vuelo que la referencien. Una solución típica conserva el recurso en una cola de destrucción hasta que un fence o un valor de timeline semaphore confirme que la GPU ha terminado.
+
+** Asignación y actualización
+
+Un gestor sencillo mantiene una lista de slots libres, una tabla de =VkImageView= y =VkSampler= y un conjunto de descriptores de larga duración. Al cargar una textura:
+
+1. Reserva un slot libre y comprueba sus límites.
+2. Crea la imagen y sube sus mipmaps.
+3. Ejecuta las transiciones y sincronizaciones necesarias para que sea legible por shaders.
+4. Escribe el descriptor correspondiente mediante =vkUpdateDescriptorSets=.
+5. Publica el índice en el buffer de materiales cuando el recurso sea seguro de utilizar.
+
+La actualización del descriptor y la visibilidad de los bytes de la imagen son problemas distintos. Las barreras de memoria para transferencias de imagen no sustituyen las reglas de sincronización de los descriptores.
+
+#+begin_src cpp
+VkDescriptorImageInfo imageInfo{};
+imageInfo.sampler = sampler;
+imageInfo.imageView = view;
+imageInfo.imageLayout =
+    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+VkWriteDescriptorSet write{
+    VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+};
+write.dstSet = textureSet;
+write.dstBinding = textureBinding;
+write.dstArrayElement = slot;
+write.descriptorCount = 1;
+write.descriptorType =
+    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+write.pImageInfo = &imageInfo;
+
+vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+#+end_src
+
+Aquí =textureBinding= debe corresponder al binding real del array, no a una constante copiada de un shader con layout diferente. Para un conjunto sin permisos de actualización después de bind, se debe actualizar en un momento permitido por las reglas de Vulkan y antes de los usos correspondientes.
+
+* Comparación con Direct3D 12 y Metal
+
+** Direct3D 12: descriptor heaps y root signatures
+
+Direct3D 12 utiliza /descriptor heaps/ visibles para la GPU. Una tabla de descriptores se describe desde una root signature, y un shader HLSL puede indexar arrays de recursos. La compatibilidad exacta depende del modelo de sombreadores, de los niveles de binding de recursos y de la configuración de la root signature.
+
+Las root signatures establecen qué parámetros son accesibles y cómo se localizan. No es necesario crear una root signature diferente para cada material. La aplicación puede construir un heap con miles de SRV y almacenar índices en buffers de materiales.
+
+Shader Model 6.6 añadió =ResourceDescriptorHeap= y =SamplerDescriptorHeap= para acceso directo a heaps mediante índices, evitando parte de la intermediación de tablas de descriptores. Requiere soporte y configuración adecuados, incluyendo los flags pertinentes de la root signature.
+
+#+begin_src hlsl
+// Esquema para Shader Model 6.6 y direct heap indexing.
+struct Material {
+    uint albedoIndex;
+    uint normalIndex;
+    uint ormIndex;
+    uint flags;
+};
+
+Texture2D<float4> albedo =
+    ResourceDescriptorHeap[NonUniformResourceIndex(material.albedoIndex)];
+SamplerState linearSampler =
+    SamplerDescriptorHeap[0];
+
+float4 color = albedo.Sample(linearSampler, uv);
+#+end_src
+
+Este fragmento es una ilustración parcial: =material= y =uv= deben declararse en el shader completo, y la root signature debe permitir indexación directa de heaps. =NonUniformResourceIndex= importa cuando el índice puede variar entre lanes.
+
+** Metal: argument buffers
+
+Metal dispone de /argument buffers/ para agrupar referencias a recursos en estructuras accesibles desde shaders. Metal también ha evolucionado en sus mecanismos de vinculación, y sus límites y posibilidades dependen de la familia de GPU y del nivel de compatibilidad.
+
+El concepto común es trasladar la selección del recurso a datos que la GPU pueda interpretar. La sintaxis y el modelo de residencia no son intercambiables entre APIs. Un motor multiplataforma debería abstraer el identificador de textura y las capacidades necesarias, no asumir que todos los dispositivos exponen una tabla global idéntica.
+
+* Bindless y GPU-driven: una combinación especialmente potente
+
+Consideremos una escena con 100 000 instancias. Un compute shader realiza frustum culling, quizá oclusión con una pirámide de profundidad, y escribe un buffer compacto de objetos visibles. Otro buffer almacena comandos indirectos.
+
+La cadena conceptual sería:
+
+#+begin_src text
+instancias + materiales
+         |
+         v
+ compute culling
+         |
+         v
+objetos visibles + comandos indirectos
+         |
+         v
+draw indirect / mesh shaders
+         |
+         v
+materialId -> índice -> tabla de texturas
+#+end_src
+
+El punto clave es que el dibujo no necesita que la CPU cambie de material entre objetos. Cada objeto transporta su identificador y el shader busca sus recursos. Eso facilita que la GPU genere trabajo por sí misma.
+
+Sin embargo, un sistema GPU-driven debe resolver cómo pasar el identificador de objeto a la etapa de fragmento. Según la API y el tipo de dibujo, pueden utilizarse =gl_DrawID=, =gl_BaseInstance=, índices de instancia o un buffer de metadatos por comando. No es correcto asumir que todas estas variables existen y significan lo mismo en todas las combinaciones de Vulkan, extensiones y versiones de shader.
+
+También debe existir sincronización entre el compute shader que produce comandos y el consumidor de dibujo indirecto. En Vulkan, una barrera debe hacer visibles las escrituras de shader para la lectura de comandos indirectos y, cuando corresponda, para las lecturas posteriores de los buffers de objetos.
+
+* Texturas virtuales y residencia: lo que bindless no resuelve
+
+Una tabla grande no hace que toda la memoria de texturas quepa en VRAM. Si 10 000 texturas de 2048 por 2048 ocupan unos 16 MiB cada una sin compresión ni mipmaps, el total sería aproximadamente 156 GiB. Con mipmaps completos aumentaría alrededor de un tercio. La compresión cambia las cifras, pero no elimina el problema.
+
+El renderizado bindless se ocupa de la selección de recursos. La texturización virtual, los recursos dispersos y el streaming se ocupan de qué datos están realmente residentes. Son técnicas complementarias.
+
+En un motor de mundo abierto podemos mantener un descriptor estable que apunte a una textura de sustitución mientras llega el recurso real. Cuando la textura se ha cargado y es seguro actualizar su entrada, el material puede empezar a utilizarla sin modificar su identificador lógico.
+
+La estrategia exacta depende de las reglas de actualización de descriptores, de los comandos en vuelo y de si utilizamos uno o varios descriptor sets por frame. Un índice estable no garantiza por sí solo una sustitución libre de carreras.
+
+* Errores frecuentes y límites reales
+
+** Confundir bindless con velocidad garantizada
+
+Un renderizador con 500 objetos y 10 materiales quizá no mejore nada. El coste de crear y mantener tablas, gestionar slots y soportar rutas alternativas puede superar el ahorro de CPU. Conviene medir por separado tiempo de preparación de comandos, tiempo GPU y uso de memoria.
+
+** Indexar fuera del rango válido
+
+Los accesos a índices inexistentes o a descriptores no válidos pueden producir comportamiento indefinido o errores de validación. =PARTIALLY_BOUND= no es una protección de memoria universal. Se deben validar los identificadores, inicializar slots de sustitución y comprobar límites.
+
+** Olvidar el tiempo de vida
+
+Liberar una imagen inmediatamente después de retirar su handle de CPU es incorrecto si la GPU todavía la utiliza. La vida útil de los recursos debe estar ligada al progreso real de la cola de ejecución.
+
+** Suponer que todas las GPUs tienen los mismos límites
+
+El número máximo de descriptores, las características de indexación no uniforme y el soporte de actualizaciones después de bind dependen del dispositivo. Una implementación portable consulta capacidades y puede tener rutas alternativas basadas en conjuntos más pequeños.
+
+** Confundir uniformidad con material único por dibujo
+
+Aunque cada dibujo use un material distinto, las invocaciones dentro de una wave pueden mezclar materiales por instancing, por comandos multidraw o por cómo se distribuye el trabajo. La anotación de índice no uniforme debe reflejar la semántica real, no una suposición basada en la organización de la CPU.
+
+* Laboratorio: construir y medir una versión mínima
+
+Para comprobar las ventajas, podemos implementar dos rutas Vulkan que dibujen la misma escena con idénticas geometrías y texturas. La primera cambia el descriptor set por material; la segunda usa una tabla global y un buffer de materiales.
+
+La escena de prueba debería incluir, por ejemplo, 10 000 instancias de cajas y 512 materiales. Ejecutaríamos tres variantes: objetos agrupados por material, objetos mezclados aleatoriamente y objetos ordenados por profundidad. Así separamos el efecto del número de cambios de descriptor de la localidad de texturas.
+
+Mediríamos con un temporizador de CPU el tiempo de construcción de command buffers y con timestamps de GPU el tiempo de ejecución, descartando frames de calentamiento y usando percentiles además de medias. Repetiríamos con instancing o multidraw indirect para observar cuándo desaparece el coste de los cambios de recursos y cuándo pasa a dominar el coste de los comandos.
+
+Una tabla útil incluiría: dibujos por frame, cambios de descriptor set, descriptores residentes, tiempo CPU de grabación, tiempo GPU, uso de VRAM y errores de validación. Sin estas medidas no podemos atribuir una mejora al uso de bindless.
+
+Como extensión, podríamos implementar una cola de retirada de texturas por timeline semaphore y probar cargas y descargas mientras se renderiza. Este ejercicio suele descubrir más errores reales que una demo estática.
+
+* Conclusiones
+
+Bindless no consiste en eliminar los bindings, sino en cambiar la unidad de trabajo: en vez de seleccionar recursos objeto por objeto desde la CPU, publicamos tablas relativamente estables y dejamos que los shaders elijan por índice.
+
+Esta decisión facilita escenas con muchos materiales, renderizado indirecto y pipelines dirigidos por GPU. Pero también traslada responsabilidades al motor: gestión de identificadores, residencia, límites del dispositivo, sincronización y vida útil de los recursos.
+
+La lección histórica es interesante. En la época de OpenGL clásico el estado de textura era parte de la secuencia de comandos; en Vulkan y D3D12 modernos, el recurso puede convertirse en un dato indexable por el shader. Es una transformación arquitectónica, no solamente una nueva función de API.
+
+La siguiente etapa natural es estudiar cómo se combina esta indirección con el streaming de texturas, los buffers de materiales compactos y la selección de objetos totalmente realizada en GPU.
+
+* Referencias primarias y documentación
+
+- Khronos, /Vulkan Guide: Descriptor Indexing/. Explica arrays en tiempo de ejecución, indexación no uniforme y capacidades asociadas. [[https://docs.vulkan.org/guide/latest/descriptor_arrays.html][Guía oficial de arrays de descriptores]].
+- Khronos, /Vulkan Specification/, sección de descriptor sets y descriptor indexing. Fuente normativa para flags, límites y actualización. [[https://docs.vulkan.org/spec/latest/chapters/descriptorsets.html][Especificación de descriptor sets]].
+- Khronos, /VK_EXT_descriptor_indexing/. Texto de la extensión y motivación original, incorporada a Vulkan 1.2. [[https://registry.khronos.org/vulkan/specs/latest/man/html/VK_EXT_descriptor_indexing.html][Referencia de la extensión]].
+- Microsoft, /Resource Binding in Direct3D 12/. Describe heaps, tablas y root signatures. [[https://learn.microsoft.com/en-us/windows/win32/direct3d12/resource-binding][Documentación oficial D3D12]].
+- Microsoft, /HLSL Shader Model 6.6/. Incluye indexación directa de heaps de recursos y samplers. [[https://microsoft.github.io/DirectX-Specs/d3d/HLSL_SM_6_6_DynamicResources.html][Especificación Shader Model 6.6]].
+- Apple, /Managing Groups of Resources with Argument Buffers/. Introducción oficial al modelo Metal. [[https://developer.apple.com/documentation/metal/managing-groups-of-resources-with-argument-buffers][Documentación de argument buffers]].
+- Khronos, /Vulkan Samples/, ejemplo de descriptor indexing. Código de referencia para estudiar características y layouts. [[https://github.com/KhronosGroup/Vulkan-Samples/tree/main/samples/extensions/descriptor_indexing][Repositorio oficial de ejemplos]].
+
+Las referencias normativas de Khronos y Microsoft deben prevalecer sobre las simplificaciones de los fragmentos pedagógicos. Los números de rendimiento del artículo son hipotéticos y no proceden de benchmarks publicados.
