@@ -1,0 +1,364 @@
+#+TITLE: Nintendo 64 y los 4 KiB de TMEM: texturas, tiles y el coste oculto de cambiar de material
+#+DATE: <2026-11-21 Sat>
+#+LANGUAGE: es
+#+OPTIONS: toc:3 num:t
+#+STARTUP: overview
+#+FILETAGS: :historia:retro:n64:rdp:texturas:
+
+* Introducción: una consola de 1996 con un problema muy actual
+
+En 1996, Nintendo 64 llegó con una combinación singular: CPU MIPS, un coprocesador de geometría programable y una unidad de rasterización capaz de corregir la perspectiva, filtrar texturas y combinar colores. No era simplemente una máquina de dibujar polígonos planos. Sin embargo, muchos de sus juegos muestran paredes de aspecto suave, patrones pequeños y materiales repetidos. ¿Por qué un hardware con filtrado de texturas producía a menudo imágenes tan borrosas?
+
+Una respuesta parcial es sorprendentemente pequeña: *4096 bytes*. La unidad de texturas del Reality Display Processor (RDP) no muestreaba directamente toda la memoria principal como si fuera una colección ilimitada de texturas. Utilizaba una memoria interna, TMEM, en la que el programa debía cargar explícitamente los texeles necesarios para los siguientes polígonos.
+
+Este artículo no atribuye toda la estética de Nintendo 64 a TMEM. También importaban la resolución de salida, el antialiasing, los formatos de los recursos, el filtrado, el framebuffer y las decisiones artísticas. Nos centraremos en una pregunta más precisa: ¿cómo condicionaba una caché de texturas explícita de 4 KiB la arquitectura del renderizador?
+
+La lección resulta útil incluso para programar Vulkan, Metal o WebGPU. Las memorias actuales son mucho mayores, pero sigue siendo necesario distinguir entre almacenar recursos, mantenerlos cerca de la unidad que los consume y ordenar el trabajo para evitar transferencias y cambios de estado.
+
+* 1. El recorrido de un triángulo: CPU, RSP y RDP
+
+El Reality Coprocessor (RCP) incluía dos piezas que conviene separar. El Reality Signal Processor (RSP) era un procesador vectorial programable mediante microcódigo; podía transformar e iluminar vértices y preparar comandos. El Reality Display Processor (RDP) ejecutaba el rasterizado y el procesamiento de píxeles. La CPU preparaba listas de visualización, y el hardware las recorría según el microcódigo y el estado configurado.
+
+Esta división no es exactamente equivalente a un pipeline de shaders moderno. No había un fragment shader arbitrario por píxel. El RDP tenía unidades y modos especializados: rasterizador, generador de coordenadas de textura, filtrado, combinador de color y mezcla. El programa elegía modos y parámetros, pero no podía sustituir libremente cada etapa por código propio.
+
+Para texturizar un triángulo, el flujo conceptual era:
+
+1. Conservar la imagen original en RDRAM.
+2. Cargar en TMEM la región que se utilizará.
+3. Configurar un descriptor de tile con formato, dirección, stride y reglas de coordenadas.
+4. Activar texturizado y establecer los parámetros de muestreo.
+5. Emitir los triángulos que utilizan ese tile.
+
+La distinción entre el paso 2 y el 3 es esencial: *cargar datos* no es lo mismo que *describir cómo interpretarlos*. Un descriptor puede apuntar a una región de TMEM, y varios descriptores pueden describir distintos usos de los datos residentes.
+
+* 2. ¿Por qué no leer cada texel directamente de RDRAM?
+
+Un rasterizador necesita acceder a coordenadas aparentemente irregulares. Dos píxeles vecinos de pantalla pueden corresponder a posiciones próximas en una textura, pero un triángulo oblicuo, un filtrado de varios texeles o una combinación de dos texturas requieren varias lecturas y direcciones que no siempre son secuenciales.
+
+La memoria externa proporciona capacidad, pero su latencia y su ancho de banda no son equivalentes a los de una pequeña SRAM situada junto a la unidad de textura. El manual de programación de Nintendo describe TMEM como una caché gestionada por el programador, precisamente para ofrecer accesos de textura predecibles.
+
+Hay una diferencia importante respecto a una caché transparente de CPU. Una caché convencional intenta llenar líneas automáticamente al producirse un fallo. En el RDP, el software indica cuándo y qué cargar. El cambio de textura forma parte explícita de la lista de comandos.
+
+** Una cuenta que cambia el diseño de los recursos
+
+Para una imagen sin compresión ni paleta:
+
+\[
+B = W\,H\,\frac{b}{8}
+\]
+
+donde W y H son las dimensiones y b los bits por texel. El máximo teórico que cabe en 4096 bytes es:
+
+| Formato | Bits/texel | Texeles teóricos en 4 KiB | Ejemplo |
+|---------+------------+--------------------------+---------|
+| RGBA32  |         32 |                     1024 | 32 x 32 |
+| RGBA16  |         16 |                     2048 | 64 x 32 |
+| IA8     |          8 |                     4096 | 64 x 64 |
+| I4      |          4 |                     8192 | 128 x 64 |
+
+Estas cifras son *presupuestos aritméticos*, no garantías de que cualquier disposición y modo de muestreo permita utilizar toda TMEM. El stride, el alineamiento, las paletas y la organización física introducen restricciones adicionales. En particular, el modo de color indexado CI reserva espacio para la tabla de consulta de colores (TLUT); no debe tratarse como si los 4096 bytes estuvieran libres para índices.
+
+Una textura RGBA16 de 128 x 128 ocupa 32768 bytes, ocho veces TMEM. No basta con pedirle al RDP que la utilice completa. Hay que dividirla en regiones, rediseñar el material o elegir otra representación.
+
+** El coste de un atlas grande
+
+Un atlas puede reducir cambios de material a nivel de motor, pero no elimina el límite de residencia. Si contiene ocho regiones de 64 x 32 RGBA16, cada región consume 4096 bytes y, aunque todas estén contiguas en RDRAM, no pueden residir simultáneamente en TMEM. Un atlas grande y una textura grande son problemas distintos para el sistema de recursos, pero ambos pueden necesitar cargas parciales.
+
+* 3. Los ocho descriptores de tile no son ocho memorias de 4 KiB
+
+El RDP ofrece ocho descriptores de tile. Cada descriptor contiene, entre otros, formato, profundidad de texel, dirección inicial en TMEM, longitud de línea, parámetros de clamp, mirror, mask y shift para S y T, y límites de la región.
+
+No son ocho bancos independientes de 4096 bytes. Los ocho descriptores comparten la misma TMEM. Dos tiles pueden apuntar a zonas diferentes, e incluso interpretar datos comunes de maneras distintas cuando la configuración lo permite.
+
+Esta separación se parece a la diferencia moderna entre una imagen de GPU y una vista de imagen: el almacenamiento existe por un lado, mientras que el descriptor determina cómo se accede a él. La analogía ayuda, pero no es identidad: las restricciones del RDP son específicas y mucho más rígidas.
+
+** Coordenadas, wrapping y mirroring
+
+Supongamos una textura de 32 texeles de anchura. Un índice entero s puede envolverse con:
+
+\[
+s_{wrap}=s\bmod 32
+\]
+
+Para una dimensión potencia de dos, equivale a aplicar una máscara de cinco bits. El parámetro =mask S= permite definir esta periodicidad. Con mirror, períodos alternos invierten el sentido de la coordenada. Clamp, en cambio, limita el muestreo a los extremos.
+
+El parámetro shift permite ajustar la escala de coordenadas antes de acceder al tile. Esto evita que cada vértice tenga que contener coordenadas reescritas para todas las variaciones de escala.
+
+Pero el orden exacto de las operaciones, la representación fija y el comportamiento en bordes dependen del RDP. Un emulador fiel no debe reemplazarlos alegremente por =GL_REPEAT= y esperar resultados idénticos.
+
+* 4. Transferir un bloque o transferir un rectángulo
+
+Las macros de la interfaz gráfica de Nintendo distinguen operaciones como =gDPLoadTextureBlock= y =gDPLoadTextureTile=. La primera es apropiada para transferir una región contigua preparada para el formato requerido; la segunda permite seleccionar un subrectángulo de una imagen mayor, con reglas de alineamiento por fila.
+
+No se trata de dos nombres para el mismo coste. Una transferencia de bloque puede aprovechar mejor el acceso secuencial a RDRAM. Una carga de tile facilita el trabajo con texturas grandes sin copiar primero un subrectángulo a un búfer temporal. El manual advierte que las macros de alto nivel expanden a varios comandos y que las variantes de bajo nivel imponen restricciones adicionales.
+
+El stride se expresa en unidades de 64 bits. Para una fila de 32 texeles RGBA16:
+
+\[
+\operatorname{line}=\frac{32\cdot16}{64}=8
+\]
+
+Para una anchura que no produce un múltiplo de ocho bytes, hay que considerar el redondeo y el relleno. Un programador que calcule simplemente =width * bytesPerPixel= como distancia entre filas puede describir mal el almacenamiento de TMEM.
+
+** Un ejemplo con macros de display list
+
+El siguiente fragmento ilustra la intención de la API clásica; presupone que =texture_rgba16= contiene 32 x 32 texeles en el formato esperado por el SDK y que =p++= avanza sobre una lista válida. No es un programa completo ni sustituye la configuración del combinador y del modo de renderizado.
+
+#+begin_src c
+/* Esquema GBI clásico; requiere cabeceras y SDK N64. */
+gDPLoadTextureBlock(
+    p++, texture_rgba16,
+    G_IM_FMT_RGBA, G_IM_SIZ_16b,
+    32, 32, 0,
+    G_TX_WRAP, G_TX_WRAP,
+    5, 5, G_TX_NOLOD, G_TX_NOLOD
+);
+gSPTexture(p++, 0xFFFF, 0xFFFF, 0, G_TX_RENDERTILE, G_ON);
+gSP1Triangle(p++, 0, 1, 2, 0);
+#+end_src
+
+Una textura de 32 x 32 RGBA16 consume 2048 bytes antes de considerar otras necesidades. La macro de carga configura estados y transferencias necesarios para la textura. Si se utilizan comandos de nivel inferior, el programador debe gestionar explícitamente la sincronización.
+
+* 5. La sincronización: la parte invisible de una textura
+
+El RDP procesa comandos de manera encadenada. Si el programa cambia la descripción de un tile mientras el rasterizador todavía utiliza la configuración anterior, o sobrescribe TMEM mientras se consume una textura, aparecen riesgos de ordenación.
+
+Las interfaces =gDPLoadSync= y =gDPTileSync= expresan distintas necesidades de sincronización. La documentación explica que las macros =gDPLoadTexture*= ya incluyen las sincronizaciones apropiadas para sus operaciones habituales. Insertar sincronizaciones sin entender el flujo puede desperdiciar tiempo; omitirlas al trabajar a bajo nivel puede producir resultados incorrectos.
+
+La comparación con Vulkan es instructiva: allí las barreras especifican etapas, accesos y transiciones de recursos; aquí el dominio es más especializado y el estado está ligado a las unidades del RDP. En ambos casos, el orden de comandos no debe confundirse con una garantía universal de que todas las unidades han terminado de utilizar todos los datos.
+
+* 6. Perspectiva: por qué no basta con interpolar S y T
+
+Las coordenadas de textura se asocian a los vértices de un triángulo, pero la proyección perspectiva transforma la geometría de manera no lineal. Interpolar directamente las coordenadas de textura en espacio de pantalla produce el conocido efecto de texturas que parecen deslizarse o deformarse sobre superficies oblicuas.
+
+Si un vértice tiene coordenadas (u,v) y coordenada homogénea w, definimos:
+
+\[
+q=1/w,\qquad a=u/w,\qquad b=v/w
+\]
+
+En el triángulo proyectado se interpolan linealmente a, b y q usando coordenadas baricéntricas de pantalla \(\lambda_i\):
+
+\[
+a(x,y)=\sum_i\lambda_i\frac{u_i}{w_i},
+\quad
+q(x,y)=\sum_i\lambda_i\frac{1}{w_i}
+\]
+
+y recuperamos:
+
+\[
+u(x,y)=\frac{a(x,y)}{q(x,y)},\qquad
+v(x,y)=\frac{b(x,y)}{q(x,y)}
+\]
+
+Esta división es la esencia de la corrección de perspectiva. El manual del RDP distingue explícitamente los modos =G_TP_PERSP= y =G_TP_NONE=. El primero se emplea normalmente en geometría 3D; el segundo resulta útil en operaciones 2D, donde no se necesita esa transformación.
+
+** Ejemplo numérico
+
+Imaginemos dos extremos con u=0 y u=1, y valores de w=1 y w=4. En el punto medio de pantalla, una interpolación afín daría u=0.5. La interpolación correcta es:
+
+\[
+u=\frac{0.5(0/1)+0.5(1/4)}
+        {0.5(1/1)+0.5(1/4)}
+  =\frac{0.125}{0.625}=0.2
+\]
+
+La diferencia es enorme. No es una sutileza del filtrado: afecta a dónde se busca el texel antes de aplicar cualquier filtro.
+
+En un renderizador software didáctico podemos reproducirlo así:
+
+#+begin_src cpp
+#include <array>
+#include <cassert>
+
+struct Vertex {
+    float u, v, w;
+};
+
+struct UV { float u, v; };
+
+UV perspective_uv(const std::array<Vertex, 3>& vertices,
+                  const std::array<float, 3>& lambda) {
+    float uq = 0.0f, vq = 0.0f, q = 0.0f;
+    for (int i = 0; i != 3; ++i) {
+        assert(vertices[i].w != 0.0f);
+        float weighted_q = lambda[i] / vertices[i].w;
+        uq += vertices[i].u * weighted_q;
+        vq += vertices[i].v * weighted_q;
+        q += weighted_q;
+    }
+    assert(q != 0.0f);
+    return {uq / q, vq / q};
+}
+#+end_src
+
+Este ejemplo usa coma flotante para explicar la matemática. No reproduce la precisión fija ni los redondeos internos del RDP, que importan cuando se pretende emularlo con exactitud.
+
+* 7. El filtrado no puede inventar detalle
+
+Una vez calculada la coordenada, el filtro reconstruye un color a partir de texeles próximos. La interpolación bilineal ideal de cuatro muestras puede escribirse:
+
+\[
+C=(1-a)(1-b)C_{00}+a(1-b)C_{10}
+ +(1-a)bC_{01}+abC_{11}
+\]
+
+con a y b como fracciones locales. La unidad de filtrado de Nintendo 64 dispone de modos y detalles de implementación que no deben identificarse sin matices con el filtrado bilineal ideal de una GPU actual. En particular, sus combinaciones de muestras y precisión pueden producir diferencias visibles frente a un muestreador moderno.
+
+Lo importante es separar dos fuentes de suavidad. Una textura original pequeña carece de altas frecuencias espaciales; ampliar sus texeles no recupera los detalles ausentes. Además, el filtrado mezcla valores próximos para suavizar la reconstrucción. Ambos efectos pueden coexistir.
+
+El aliasing aparece en el problema opuesto: al reducir una textura, muchos texeles contribuyen potencialmente a un único píxel. El muestreo puntual o bilineal de una sola resolución no es un filtro de área suficiente para todas las escalas. Los mipmaps reducen la frecuencia antes del muestreo, pero cada nivel adicional necesita almacenamiento, y en TMEM el presupuesto es extremadamente ajustado.
+
+** Presupuesto de una cadena mipmap
+
+Para una textura cuadrada con dimensiones potencias de dos, la suma aproximada de áreas de una cadena completa es:
+
+\[
+A_{total}=A_0\left(1+\frac14+\frac1{16}+\cdots\right)
+\approx\frac43 A_0
+\]
+
+Una base RGBA16 de 32 x 32 ocupa 2048 bytes. Su cadena completa requiere aproximadamente 2730 bytes antes de alineamientos y restricciones de bancos. En cambio, una base RGBA16 de 64 x 32 ya ocupa los 4096 bytes: no deja sitio para niveles adicionales en una disposición ingenua.
+
+El manual contempla selección de nivel de detalle y modos de textura detallada, pero su disponibilidad real depende de cómo se organicen los tiles y de los modos del RDP. No basta con activar un interruptor universal de mipmapping.
+
+* 8. La organización física: por qué TMEM no es un array trivial
+
+Los diagramas del manual muestran una TMEM dividida en bancos. Esta organización responde al acceso simultáneo a varios texeles, necesario para el filtrado. Si todos los texeles de una vecindad cayeran en el mismo banco de un solo puerto, no podrían leerse a la velocidad prevista.
+
+El diseño reorganiza determinados datos de filas alternas. Por eso una copia lineal de bytes a un array de 4096 posiciones no constituye por sí sola un emulador de TMEM. Es necesario modelar la correspondencia entre direcciones lógicas, formato, filas y bancos.
+
+Para el desarrollo de un motor propio, conviene distinguir dos niveles:
+
+- Modelo lógico: bytes residentes, tiles, formatos, dimensiones y operaciones de carga.
+- Modelo físico: bancos, intercambio de palabras, direccionamiento exacto y restricciones de acceso.
+
+El primero permite estudiar estrategias de carga. El segundo es indispensable para reproducir artefactos y compatibilidad de juegos originales. No hay que confundir una simulación pedagógica con una implementación ciclo a ciclo.
+
+* 9. Planificar los materiales: un pequeño problema de scheduling
+
+Supongamos una escena con cien triángulos, distribuidos en cuatro materiales A, B, C y D. Cada material utiliza una textura de 2048 bytes. Si dibujamos los triángulos en el orden A, B, A, C, A, D, B..., quizá tengamos que recargar con frecuencia los datos. Si agrupamos los triángulos por material, podemos reducir transferencias.
+
+Para un modelo simplificado:
+
+\[
+T_{frame}=T_{geom}+T_{raster}+N_{load}T_{load}
+          +N_{state}T_{state}
+\]
+
+La expresión no pretende ser un modelo temporal exacto del RDP: los comandos y el trabajo pueden solaparse, y el coste de carga depende del tamaño y del acceso a memoria. Sí permite formular una hipótesis medible: reducir =N_load= debería ayudar cuando las transferencias son una fracción significativa del tiempo.
+
+** Un planificador didáctico en C++20
+
+El siguiente algoritmo no es un controlador del RDP. Simula un presupuesto de 4096 bytes y muestra qué materiales están residentes. Su política es expulsar todos los materiales cuando el siguiente no cabe, una estrategia sencilla pero deliberadamente subóptima.
+
+#+begin_src cpp
+#include <cstddef>
+#include <iostream>
+#include <vector>
+
+struct Material {
+    int id;
+    std::size_t bytes;
+};
+
+void simulate(const std::vector<Material>& draw_order) {
+    constexpr std::size_t capacity = 4096;
+    std::vector<int> resident;
+    std::size_t used = 0;
+    int loads = 0;
+
+    for (const auto& m : draw_order) {
+        if (m.bytes > capacity) {
+            std::cerr << "Material requiere subdividirse: "
+                      << m.id << '\n';
+            continue;
+        }
+        bool found = false;
+        for (int id : resident)
+            found |= (id == m.id);
+        if (found) continue;
+
+        if (used + m.bytes > capacity) {
+            resident.clear();
+            used = 0;
+        }
+        resident.push_back(m.id);
+        used += m.bytes;
+        ++loads;
+    }
+    std::cout << "Cargas simuladas: " << loads << '\n';
+}
+#+end_src
+
+Este modelo omite alineamiento, paletas, tamaños de fila, superposición de tiles y sincronización. Su valor es aislar la *localidad temporal*: usar repetidamente un material mientras sus texeles permanecen residentes.
+
+** ¿Por qué no ordenar siempre por textura?
+
+Porque el orden de dibujo también afecta a otros requisitos. Los objetos transparentes suelen necesitar un orden de composición; la visibilidad y el Z-buffer influyen en el trabajo desperdiciado; las listas de visualización pueden estar organizadas por habitaciones, sectores o microcódigo. Ordenar todo por material podría aumentar sobre-dibujo o violar dependencias.
+
+Una estrategia razonable es agrupar primero por restricciones de visibilidad y transparencia, y dentro de cada grupo minimizar cambios de textura. La misma tensión existe en motores actuales entre batching, ordenación front-to-back y costes de pipeline.
+
+* 10. Comparación con PC de la época y GPUs modernas
+
+Las tarjetas aceleradoras de PC de mediados y finales de los noventa también tenían memorias de textura y restricciones importantes. Sin embargo, el contrato de programación variaba: algunas exponían una memoria de texturas mucho mayor y una API que abstraía más las transferencias; Nintendo 64 hacía muy visible la carga a una memoria diminuta de trabajo.
+
+No sería riguroso comparar directamente 4 KiB de TMEM con los megabytes de VRAM de una tarjeta 3dfx: la VRAM es almacenamiento de mayor capacidad, mientras que TMEM es una memoria interna cercana al muestreador. Son niveles distintos de la jerarquía.
+
+En Vulkan, por ejemplo, una textura puede residir en memoria de dispositivo, ser accesible mediante un descriptor y atravesar cachés de textura gestionadas por hardware. El programador controla asignación, sincronización y, en ciertos casos, residencia dispersa, pero normalmente no emite una orden equivalente a «carga estos 2048 bytes en la SRAM exacta del sampler».
+
+La continuidad conceptual es el *working set*: cuántos bytes necesita la siguiente fase de trabajo y qué coste tiene traerlos cerca de la unidad de ejecución. La diferencia es quién administra la localidad y con qué granularidad.
+
+* 11. Laboratorio: reproducir las restricciones sin una Nintendo 64
+
+Una práctica interesante es construir un pequeño rasterizador software que admita imágenes RGBA16, un almacén TMEM lógico de 4096 bytes y un máximo de ocho descriptores. El programa puede cargar un tile desde una imagen mayor, rasterizar triángulos con coordenadas corregidas por perspectiva y registrar los bytes transferidos.
+
+Primera prueba: un suelo con una textura de 128 x 128. Dividir la geometría en subregiones de textura de 32 x 32, cargar cada región y medir el número de cambios. Segunda prueba: dibujar un laberinto con materiales alternos y comparar el orden original con el orden agrupado. Tercera prueba: cambiar entre nearest, interpolación bilineal ideal y un filtro aproximado al RDP, documentando que este último no es una emulación exacta.
+
+Métricas útiles: cargas por fotograma, bytes transferidos, número de triángulos, tiempo CPU del planificador, porcentaje de materiales reutilizados y error visual respecto a una referencia de alta resolución.
+
+Para ir más lejos, libdragon ofrece una vía moderna de programación de Nintendo 64; su API de RDP y sus ejemplos deben estudiarse por separado del SDK histórico, pues no todas las macros o supuestos coinciden. En un emulador, los resultados deberían contrastarse con documentación de registros y pruebas sobre hardware real cuando sea posible.
+
+* 12. Limitaciones y errores frecuentes
+
+** Confundir ocho tiles con ocho texturas completas
+
+Un descriptor no reserva automáticamente una porción de memoria. Ocho descriptores comparten 4096 bytes, y sus regiones pueden solaparse. La cantidad de texturas residentes depende del formato y del espacio realmente ocupado.
+
+** Atribuir todo el desenfoque a un filtro
+
+La resolución del recurso, la resolución de salida, la corrección de perspectiva, el filtrado y el procesamiento posterior son fenómenos diferentes. Una comparación justa necesita controlar cada uno.
+
+** Suponer que 4096 bytes siempre son utilizables
+
+Las paletas, la disposición de bancos, el alineamiento y las operaciones de filtrado cambian la capacidad práctica. Las tablas de capacidad del manual distinguen formatos y modos.
+
+** Tratar el código GBI como una API moderna
+
+Las macros de display list generan comandos para un hardware concreto. No son llamadas inmediatas a un controlador contemporáneo. La sincronización y la vida útil de los datos dependen del procesamiento de esas listas.
+
+** Equiparar la simulación con una emulación exacta
+
+Un modelo de bytes y tiles explica los costes de localidad. Para reproducir el comportamiento real hay que modelar representación numérica, filtrado, direccionamiento, modos de combinación y detalles físicos.
+
+* 13. Conclusiones
+
+Los 4 KiB de TMEM explican una parte importante de cómo se diseñaban las texturas para Nintendo 64, pero su enseñanza más profunda es arquitectónica. Una GPU no necesita solamente potencia aritmética: necesita alimentar sus unidades con datos en el momento adecuado. La capacidad de una memoria rápida, la granularidad de transferencia y el orden del trabajo pueden importar tanto como el número de triángulos.
+
+El RDP obligaba al programador a pensar explícitamente en el conjunto de texeles que iba a consumir a continuación. Ese esfuerzo se refleja en texturas pequeñas, formatos compactos, regiones divididas, reutilización de tiles y listas de dibujo organizadas. Los motores modernos han trasladado gran parte de esa administración a jerarquías de caché y controladores, pero no han eliminado el problema fundamental de localidad.
+
+La próxima vez que veas una pared suavizada de un juego de Nintendo 64, no la interpretes únicamente como un efecto visual nostálgico. Es también el rastro de decisiones concretas sobre ancho de banda, memoria interna, filtrado y coste de cambiar de material.
+
+* Referencias primarias y lecturas de contraste
+
+- Nintendo, /Nintendo 64 Programming Manual/, capítulo 13, «Texture Mapping»: [[https://ultra64.ca/files/documentation/online-manuals/man/pro-man/pro13/13-01.html][descripción del pipeline de texturas y corrección de perspectiva]]. Manual técnico original, reproducción histórica.
+- Nintendo, /Nintendo 64 Programming Manual/, sección 13.8, «Texture Memory»: [[https://ultra64.ca/files/documentation/online-manuals/man-v5-2/allman52/pro-man/pro13/13-08.htm][organización de TMEM, capacidades y cargas]]. Fuente primaria.
+- Nintendo, /Nintendo 64 Programming Manual/, capítulo 12, sección 12.4, «Texture Engine»: [[https://ultra64.ca/files/documentation/online-manuals/man-v5-2/allman52/pro-man/pro12/12-04.htm][tiles, modos de muestreo y sincronización]]. Fuente primaria.
+- Nintendo, /Nintendo 64 Programming Tutorial/, capítulo 3: [[https://jrra.zone/n64/doc/tutorial/graphics/3/3_1.htm][introducción práctica al texturizado]]. Fuente primaria histórica.
+- Nintendo, /Nintendo 64 Functions Reference/, [[https://ultra64.ca/files/documentation/online-manuals/functions_reference_manual_2.0i/gdp/gDPLoadTexture.html][familia gDPLoadTexture y diferencias entre Block y Tile]]. Fuente primaria.
+- Nintendo, /Nintendo 64 Programming Manual/, [[https://ultra64.ca/files/documentation/online-manuals/man/pro-man/pro13/13-04.html][atributos de los descriptores de tile]]. Fuente primaria.
+- Ryan C. Gordon y colaboradores, [[https://github.com/DragonMinded/libdragon][libdragon]], repositorio de herramientas y bibliotecas homebrew. Implementación contemporánea; no sustituye al manual histórico.
+- Moria, [[https://www.moria.us/blog/2020/11/n64-part20-tmem-format-and-mip-maps][Nintendo 64 Part 20: TMEM Format and Mip Maps]] (2020). Análisis independiente útil para contrastar la organización de bancos; no es una especificación oficial.
+
+Las referencias reproducen documentación histórica de Nintendo; los fragmentos de código y las derivaciones didácticas de este artículo son originales. No se redistribuyen ilustraciones ni material gráfico de terceros.
