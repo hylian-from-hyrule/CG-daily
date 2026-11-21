@@ -4,6 +4,7 @@
 
 * 2026
 ** Noviembre
+- <2026-11-21 Sat> [[file:articulos/2026/11/2026-11-21-n64-tmem-texturas-tiles.org][Nintendo 64 y los 4 KiB de TMEM: texturas, tiles y el coste oculto de cambiar de material]] :historia:retro:n64:rdp:texturas:
 - <2026-11-20 Fri> [[file:articulos/2026/11/2026-11-20-bindless-descriptor-indexing.org][Bindless y descriptor indexing: cómo alimentar una GPU con millones de materiales]] :moderno:gpu:vulkan:bindless:
 - <2026-11-19 Thu> [[file:articulos/2026/11/2026-11-19-doom-bsp-visplanes-occlusion.org][DOOM 1993: BSP, recorte por columnas y visplanes sin Z-buffer]] :historia:retro:doom:bsp:
 - <2026-11-18 Wed> [[file:articulos/2026/11/2026-11-18-render-graphs-sincronizacion-recursos.org][Render graphs: dependencias, barreras y memoria transitoria en una GPU moderna]] :moderno:gpu:vulkan:render-graph:
