@@ -1,0 +1,356 @@
+#+TITLE: Temporal upscaling: reconstruir píxeles con historia, movimiento y jitter
+#+DATE: <2026-11-22 Sun>
+#+LANGUAGE: es
+#+OPTIONS: toc:3 num:t
+#+FILETAGS: :moderno:gpu:temporal:upscaling:fsr:renderizado:
+#+DESCRIPTION: De la acumulación temporal clásica a la reconstrucción moderna de resolución: derivaciones, motion vectors, disoclusiones y una implementación experimental.
+
+* Introducción: cuando dibujar menos píxeles produce una imagen mejor
+
+En 1996, el coste de un píxel era tangible: el ancho de banda de memoria, el filtrado de texturas y el fill rate imponían límites visibles. Durante muchos años, la estrategia intuitiva para mejorar la imagen consistió en aumentar la resolución o tomar varias muestras por píxel. La primera solución multiplica el trabajo de sombreado y rasterización; la segunda también consume recursos, aunque el coste depende de la técnica de antialiasing. Hoy, un motor puede renderizar a 1920×1080 y presentar a 3840×2160 sin limitarse a estirar la imagen. La clave es aprovechar muestras procedentes de fotogramas anteriores.
+
+Esta técnica se llama /temporal upscaling/ o reconstrucción temporal de resolución. Se apoya en una observación sencilla: una escena animada no cambia completamente cada 16,7 milisegundos. Si podemos identificar qué punto de la superficie visible corresponde a un píxel de ayer, sus muestras contienen información útil para reconstruir la imagen de hoy. Sin embargo, reutilizar muestras viejas sin criterio produce estelas, manchas y contornos falsos. La parte difícil no es la interpolación espacial: es decidir cuándo confiar en el pasado.
+
+El capítulo parte de los fundamentos de muestreo y antialiasing temporal, deriva la reproyección y propone un prototipo reproducible en C++ y shaders. Terminaremos con el contrato real de una API de reconstrucción como AMD FSR 2 y las diferencias con Unreal Engine TSR. El objetivo no es replicar esos sistemas industriales, sino entender sus componentes, sus errores y las decisiones que justifican su complejidad.
+
+* Del supersampling espacial al temporal
+
+** Una imagen es una integral, no una cuadrícula de puntos
+
+Idealmente, el color de un píxel no es el valor de una función en el centro de una celda, sino una integral de radiancia filtrada sobre una región. Para una imagen continua L(x,y), una simplificación del píxel i,j es:
+
+\[
+C_{ij}=\int\!\!\int L(x,y)\,h(x-i,y-j)\,dx\,dy,
+\]
+
+donde h representa el filtro de reconstrucción y la huella del píxel. Una muestra puntual aproxima esa integral con una evaluación. Si hay bordes de triángulos, líneas subpíxel o texturas con frecuencias superiores al límite de Nyquist, una muestra no basta. Aparece /aliasing/: escalones, patrones moiré y parpadeos.
+
+El supersampling clásico evalúa varias posiciones dentro de cada píxel y las combina. En un renderizador de trazado de rayos podríamos lanzar varios rayos; en rasterización podemos aumentar la resolución interna y reducir después. Pero duplicar cada dimensión cuadruplica el número de píxeles. Pasar de 1080p (2.073.600 píxeles) a 4K UHD (8.294.400) supone exactamente cuatro veces las posiciones de salida. No implica cuatro veces el tiempo total: la geometría, las cachés, los pases a resolución reducida y la carga de CPU alteran la relación.
+
+** La dimensión temporal como fuente de muestras
+
+En una escena estática, desplazar ligeramente la cámara virtual de muestreo en cada fotograma permite cubrir posiciones subpíxel distintas. En lugar de cuatro muestras en un mismo fotograma, obtenemos una por fotograma durante cuatro imágenes. Si reproyectamos las muestras a un sistema común, podemos acumularlas.
+
+Esta idea tiene precedentes en técnicas de antialiasing temporal, pero la presentación de Brian Karis, /High Quality Temporal Supersampling/, en SIGGRAPH 2014, ayudó a popularizar en motores modernos la combinación de jitter, reproyección y rechazo de historia. El paso de TAA a temporal upscaling consiste en reconstruir directamente a una resolución de presentación superior a la de rasterización, y no simplemente suavizar una imagen ya renderizada a resolución nativa.
+
+Conviene separar tres conceptos. Un escalador espacial utiliza únicamente el fotograma actual; un TAA utiliza historia para estabilizar y suavizar; un escalador temporal combina muestras históricas para producir una imagen con más resolución que la entrada. Una técnica comercial puede incorporar además filtros espaciales, heurísticas de estabilidad, nitidez y aprendizaje automático. No todos los sistemas modernos emplean redes neuronales: FSR 2 y TSR constituyen ejemplos documentados de reconstrucción temporal sin exigir una red neuronal para el núcleo de la técnica.
+
+* El primer ingrediente: jitter subpíxel
+
+** Desplazar la proyección, no los objetos
+
+Imaginemos una resolución interna de 1280×720. En el fotograma cero tomamos una muestra cerca del centro; en el siguiente, desplazamos la proyección una fracción de píxel. El patrón de muestras debe distribuirse bien, sin repetir siempre los mismos desplazamientos.
+
+Una secuencia común es Halton en bases 2 y 3. Para un entero n, su radical inversa en base b se define invirtiendo los dígitos de n expresados en esa base:
+
+\[
+\phi_b(n)=\sum_{k=0}^{\infty} d_k b^{-(k+1)}.
+\]
+
+Si n=5, en base 2 tenemos 101 y \(\phi_2(5)=1/2+1/8=0,625\). Para obtener un desplazamiento centrado en un píxel usamos \(j_n=(\phi_2(n)-0,5,\phi_3(n)-0,5)\).
+
+#+begin_src cpp
+#include <cstdint>
+#include <utility>
+
+double halton(uint32_t n, uint32_t base) {
+    double result = 0.0, scale = 1.0 / base;
+    while (n != 0) {
+        result += double(n % base) * scale;
+        n /= base;
+        scale /= base;
+    }
+    return result;
+}
+
+std::pair<double, double> jitter(uint32_t frame) {
+    uint32_t n = 1 + (frame % 16); // ciclo didáctico, no preset de FSR
+    return {halton(n, 2) - 0.5, halton(n, 3) - 0.5};
+}
+#+end_src
+
+El resultado se expresa en píxeles de la resolución de renderizado. Para una proyección que trabaja en coordenadas NDC de [-1,1], una traslación horizontal de j_x píxeles equivale en magnitud a \(2j_x/W_r\), y verticalmente a \(2j_y/H_r\). El signo vertical depende de la convención del framebuffer y de la API. No basta con sumar valores a cualquier entrada de la matriz: la ubicación concreta depende de si se usan vectores fila o columna y de la convención de proyección.
+
+#+begin_src cpp
+struct Vec2 { float x, y; };
+
+Vec2 jitter_ndc(Vec2 jitter_pixels, float width, float height) {
+    // Convención: X hacia la derecha, Y de NDC hacia arriba.
+    return {2.0f * jitter_pixels.x / width,
+           -2.0f * jitter_pixels.y / height};
+}
+#+end_src
+
+En un motor real debemos aplicar el mismo jitter a todos los pases cuya imagen va a reconstruirse. Los vectores de movimiento suelen calcularse sin jitter para representar desplazamiento geométrico y no confundir el movimiento de la cámara de muestreo con movimiento de objetos. AMD documenta explícitamente esta distinción, así como la necesidad de comunicar el jitter al escalador.
+
+** ¿Por qué no basta con sumar fotogramas?
+
+Si la cámara se mueve, el mismo píxel de pantalla observa superficies distintas. Si una puerta se abre, aparece fondo que ayer estaba oculto. Si un objeto cambia de iluminación, su color histórico deja de ser representativo. La acumulación directa mezcla observaciones que no corresponden al mismo punto y crea fantasmas.
+
+La solución requiere reproyección geométrica, validación de visibilidad y una política de mezcla adaptable. El orden importa: primero debemos encontrar la muestra histórica candidata; después evaluar si merece confianza; por último, decidir cuánto contribuye.
+
+* Reproyección: llevar el píxel actual al fotograma anterior
+
+** Coordenadas homogéneas y profundidad
+
+Sea \(p_t=(u,v,d)\) un píxel actual con profundidad d. Conocemos la matriz de vista-proyección actual \(VP_t\) y la anterior \(VP_{t-1}\). En un caso de geometría estática, podemos reconstruir el punto del mundo:
+
+\[
+X_w=(VP_t)^{-1}\,(x_{\mathrm{ndc}},y_{\mathrm{ndc}},z_{\mathrm{ndc}},1)^T,
+\qquad X_w \leftarrow X_w/X_w.w.
+\]
+
+A continuación proyectamos \(X_w\) con \(VP_{t-1}\) y dividimos por w para obtener la posición de pantalla anterior. El vector de movimiento en coordenadas UV puede definirse como:
+
+\[
+v_t(u,v)=uv_{t-1}-uv_t.
+\]
+
+Entonces \(uv_{\mathrm{history}}=uv_t+v_t\). Otras APIs utilizan el signo contrario: lo importante es definirlo de forma consistente y comprobarlo con un objeto de prueba.
+
+Para objetos animados, usar únicamente matrices de cámara es insuficiente. Un personaje puede moverse aunque la cámara esté inmóvil. El vertex shader necesita conocer la posición actual y la posición anterior de la misma superficie, incluyendo animación esquelética y desplazamientos de vértices. En geometría deformable, una correspondencia incorrecta introduce velocidades erróneas.
+
+#+begin_src glsl
+#version 450
+layout(location = 0) in vec3 inPosition;
+layout(location = 0) out vec4 currClip;
+layout(location = 1) out vec4 prevClip;
+
+layout(set = 0, binding = 0) uniform Camera {
+    mat4 currMVP;  // sin jitter para velocidades
+    mat4 prevMVP;  // sin jitter para velocidades
+} camera;
+
+void main() {
+    currClip = camera.currMVP * vec4(inPosition, 1.0);
+    prevClip = camera.prevMVP * vec4(inPosition, 1.0);
+    gl_Position = currClip; // el pase real aplicaría jitter al rasterizar
+}
+#+end_src
+
+Este fragmento es deliberadamente esquemático: para animación necesitamos posiciones de vértice anteriores, no simplemente reutilizar inPosition. Además, si la rasterización usa una proyección con jitter, la salida gl_Position debe incorporar el jitter actual, manteniendo el cálculo de velocidades sin él.
+
+** El coste de una convención mal definida
+
+Supongamos que una pared se desplaza 12 píxeles hacia la derecha. Si definimos v como posición anterior menos actual, v_x=-12 píxeles. En el shader de acumulación debemos leer la historia 12 píxeles a la izquierda. Si usamos +12 por error, la imagen presenta una doble silueta a ambos lados de los bordes.
+
+También hay que definir unidades. AMD FSR 2 admite vectores a resolución interna o de presentación y utiliza un factor de escala para interpretarlos. Un buffer con velocidades expresadas en NDC, entregado como si estuviera en píxeles, puede parecer correcto en escenas quietas y fallar espectacularmente al girar la cámara.
+
+* La historia no siempre es válida: disoclusiones y rechazo
+
+** Profundidad y superficies que aparecen
+
+Una /disoclusión/ ocurre cuando una superficie anteriormente tapada queda visible. El historial almacenado en esa posición pertenece a otro objeto. Por eso el algoritmo debe rechazar o reducir la contribución histórica.
+
+Una prueba introductoria compara la profundidad del píxel actual con la profundidad histórica reproyectada. No obstante, comparar directamente valores de Z-buffer no es robusto: la profundidad de perspectiva no es lineal, el reversed-Z invierte el orden, y el movimiento de cámara altera los valores. Una implementación más sólida reconstruye posiciones o distancias en un espacio común y usa umbrales dependientes de escala, pendiente y precisión.
+
+Otra estrategia combina velocidades, discontinuidades de profundidad y diferencias de luminancia. Las heurísticas no son pruebas perfectas: un reflejo puede cambiar sin que la geometría cambie, y una sombra móvil no necesariamente dispone de su propio vector de movimiento.
+
+** Recorte de historia en el vecindario
+
+Una solución habitual consiste en limitar el color histórico a un intervalo obtenido de los colores actuales cercanos. Para un vecindario 3×3, calculamos mínimos y máximos por canal:
+
+\[
+m_c=\min_{q\in N(p)} C_t(q)_c,\qquad
+M_c=\max_{q\in N(p)} C_t(q)_c.
+\]
+
+Después:
+
+\[
+H'_c=\min(M_c,\max(m_c,H_c)).
+\]
+
+El recorte evita reutilizar colores completamente ajenos a la imagen actual, pero también puede destruir detalles finos y generar borrosidad. Una variante trabaja con media y desviación típica del vecindario, limitando la historia a \(\mu\pm k\sigma\). En ambos casos, el espacio de color elegido importa: operar en RGB lineal, luminancia/crominancia o un espacio transformado produce resultados distintos.
+
+#+begin_src glsl
+vec3 clipHistory(vec3 history, vec3 lo, vec3 hi) {
+    return clamp(history, lo, hi);
+}
+
+// En el compute shader real:
+// 1. leer vecindario actual en resolución de presentación;
+// 2. calcular lo/hi;
+// 3. reproyectar history;
+// 4. recortar y mezclar.
+#+end_src
+
+El ejemplo muestra el mecanismo, no un shader completo. La obtención de vecinos y el tratamiento de límites requieren trabajo adicional. La documentación de TSR distingue explícitamente entre /history clamping/ y heurísticas de /shading rejection/: confiar únicamente en el recorte puede crear ghosting y pérdida de detalle.
+
+** Acumulación exponencial y edad de las muestras
+
+Un esquema básico mezcla color actual y color histórico reproyectado:
+
+\[
+C^{out}_t=\alpha C_t+(1-\alpha)H'_t.
+\]
+
+Con \(\alpha=0,1\), el peso de una muestra de k fotogramas atrás decae aproximadamente como \(0,9^k\), suponiendo ausencia de rechazo y una correspondencia estable. La vida media es \(\ln(0,5)/\ln(0,9)\approx 6,58\) fotogramas. A 60 FPS, esto equivale a unos 110 ms. El cálculo explica por qué una historia demasiado persistente estabiliza detalles, pero deja estelas.
+
+Un sistema industrial varía el peso según movimiento, contraste, validez geométrica, reactividad y número de muestras acumuladas. El historial puede almacenar además confianza, profundidad o metadatos. No conviene confundir un filtro exponencial simple con un estimador estadístico óptimo: las muestras no son independientes, el ruido no siempre es estacionario y la señal cambia.
+
+* De 1080p a 4K: dónde se reconstruye realmente
+
+** Dos resoluciones, una sola imagen de salida
+
+Consideremos una escena renderizada a 1920×1080 y presentada a 3840×2160. El color actual tiene 2,07 millones de texeles; la historia de presentación tiene 8,29 millones. El algoritmo recorre la cuadrícula de salida y determina qué región de la imagen actual y qué muestra histórica corresponden a cada píxel.
+
+Para cada píxel de salida \(p_o\), se obtiene su posición normalizada \(uv_o\). Se reconstruye una estimación espacial del fotograma actual desde la textura de baja resolución (bilineal, bicúbica u otro filtro). Después se calcula la reproyección hacia la historia de alta resolución y se combinan ambas estimaciones. El jitter introduce variaciones subpíxel que, al acumularse, pueden recuperar información que no aparece en una única imagen interna.
+
+No es magia: la información no observada no puede recuperarse perfectamente. Un cable de menos de un píxel interno que nunca produce cobertura no existe en ninguna muestra. El algoritmo tampoco puede adivinar con certeza texturas ocultas o detalles destruidos por un filtro previo. Por ello, la calidad depende del patrón de muestreo, del filtrado, de la geometría, de las velocidades y del historial.
+
+** Presupuesto de memoria y ancho de banda
+
+Un buffer RGBA16F de 3840×2160 ocupa:
+
+\[
+3840\cdot2160\cdot8=66.355.200\ \mathrm{bytes}
+\approx63,28\ \mathrm{MiB}.
+\]
+
+Un par de buffers de historia con ese formato consume unos 126,56 MiB sin contar profundidad, velocidades, máscaras, buffers intermedios o alineamientos. Si el historial usa RGBA8, cada buffer requiere aproximadamente 31,64 MiB, a costa de precisión y rango dinámico. En un pipeline HDR, la elección de formato afecta al banding, al tratamiento de exposición y a la calidad de la acumulación.
+
+Aumentar resolución interna de 1080p a 1440p incrementa píxeles por factor \(2560\cdot1440/(1920\cdot1080)=1,777...\). La mejora visual no es lineal con ese coste; en escenas dominadas por sombreado puede ser considerable, pero en otras domina geometría, CPU o acceso a memoria. Hay que medir tiempos GPU por pase, no inferir FPS a partir de una fórmula de píxeles.
+
+* Construir un prototipo en Vulkan o WebGPU
+
+** Recursos y orden de pases
+
+Un prototipo mínimo necesita color HDR a resolución interna, profundidad, vectores de movimiento, dos imágenes de historia a resolución de presentación y una imagen de salida. El orden típico es:
+
+1. Rasterizar profundidad y velocidades usando matrices anteriores y actuales.
+2. Renderizar color con proyección jittered.
+3. Ejecutar un compute shader de reconstrucción espacial y temporal.
+4. Guardar la nueva historia, aplicar tonemapping y presentar.
+
+Las dos imágenes de historia se intercambian después de cada fotograma. Deben invalidarse al cambiar de escena, teletransportar la cámara, modificar radicalmente el campo de visión o redimensionar recursos sin una estrategia de remapeo.
+
+#+begin_src cpp
+struct TemporalFrame {
+    Image colorLow;      // HDR, resolución interna
+    Image depthLow;
+    Image velocityLow;
+    Image history[2];    // resolución de presentación
+    Image outputHigh;
+    unsigned frameIndex = 0;
+    bool historyValid = false;
+};
+
+void renderFrame(TemporalFrame& f, CommandBuffer& cmd) {
+    const unsigned read = (f.frameIndex + 1) % 2;
+    const unsigned write = f.frameIndex % 2;
+
+    rasterDepthAndVelocity(cmd, f.depthLow, f.velocityLow);
+    rasterJitteredColor(cmd, f.colorLow);
+    transitionForCompute(cmd, f); // layouts y barreras explícitas
+    dispatchTemporalUpscale(cmd, f.colorLow, f.depthLow,
+                           f.velocityLow, f.history[read],
+                           f.history[write], f.historyValid);
+    transitionForPresentation(cmd, f.history[write], f.outputHigh);
+    f.historyValid = true;
+    ++f.frameIndex;
+}
+#+end_src
+
+El código es pseudocódigo C++ de integración: Image, CommandBuffer y las funciones de pase representan abstracciones del motor, no símbolos de Vulkan. El historial escrito debe ser exactamente el que se utilizará en el siguiente fotograma; si outputHigh es una imagen diferente, hace falta copiar, resolver o presentar la textura adecuada. Un motor con varios fotogramas en vuelo debe proteger el historial frente a lecturas y escrituras concurrentes mediante semáforos, dependencias de render graph o un esquema explícito de recursos.
+
+** Un núcleo de compute shader didáctico
+
+#+begin_src glsl
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set=0,binding=0) uniform sampler2D currentLow;
+layout(set=0,binding=1) uniform sampler2D velocityLow;
+layout(set=0,binding=2) uniform sampler2D previousHigh;
+layout(set=0,binding=3,rgba16f) uniform writeonly image2D nextHigh;
+
+layout(push_constant) uniform Params {
+    vec2 outputSize;
+    float alpha;
+    uint historyValid;
+} params;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(params.outputSize.x) ||
+        p.y >= int(params.outputSize.y)) return;
+
+    vec2 uv = (vec2(p) + 0.5) / params.outputSize;
+    vec3 current = texture(currentLow, uv).rgb;
+    vec2 velocity = texture(velocityLow, uv).xy; // UV previo - UV actual
+    vec2 previousUV = uv + velocity;
+    bool inside = all(greaterThanEqual(previousUV, vec2(0.0))) &&
+                  all(lessThanEqual(previousUV, vec2(1.0)));
+    vec3 history = inside ? texture(previousHigh, previousUV).rgb : current;
+    float a = (params.historyValid != 0u && inside)
+              ? params.alpha : 1.0;
+    vec3 result = mix(history, current, a);
+    imageStore(nextHigh, p, vec4(result, 1.0));
+}
+#+end_src
+
+Este shader sirve para visualizar ghosting antes de introducir soluciones. No incorpora rechazo por profundidad, clamping, compensación de exposición ni máscaras reactivas; tampoco tiene una reconstrucción espacial sofisticada. Para usarlo en producción habría que añadir esos elementos, definir el formato exacto de velocidades y garantizar que los samplers y los layouts son correctos.
+
+En Vulkan, las imágenes leídas en compute suelen requerir un layout apropiado para shader reads; la imagen escrita, GENERAL. Las transiciones se expresan mediante barreras y dependencias de sincronización (por ejemplo, vkCmdPipelineBarrier2). En WebGPU, la validación de usos de textura y la separación de pases condicionan cómo se organizan las lecturas y escrituras; la idea matemática es la misma, aunque el modelo de sincronización explícita difiere.
+
+** Pruebas que detectan errores reales
+
+Antes de comparar algoritmos conviene preparar una escena con una cuadrícula de líneas de un píxel, una cámara que gira, un objeto móvil sobre fondo contrastado y partículas transparentes. Renderizar la velocidad como color permite detectar signos invertidos. Congelar la cámara y variar únicamente jitter verifica la acumulación espacial. Teletransportar la cámara comprueba la invalidación de historia. Un rectángulo que se aparta de una pared revela las disoclusiones.
+
+Medir solamente PSNR o SSIM de fotogramas aislados es insuficiente. La calidad temporal incluye estabilidad, ghosting, retardo de respuesta y fluctuaciones de detalle. Es útil capturar secuencias completas y compararlas con una referencia de alta resolución, con cámara y semillas de animación idénticas.
+
+* Integración industrial: FSR 2 y Unreal TSR
+
+** El contrato de FSR 2
+
+AMD FSR 2 documenta entradas concretas: color, profundidad, motion vectors, exposición y máscaras opcionales de reactividad y transparencia/composición. El color y la profundidad suelen estar a resolución de renderizado; la historia y la salida operan a resolución de presentación. El algoritmo requiere jitter conocido y un indicador de reset cuando la cámara realiza un salto. El renderizador debe entregar velocidades correctas, idealmente también para objetos con alpha test y deformaciones.
+
+La máscara reactiva señala regiones donde el sombreado o la composición cambian sin correspondencia geométrica fiable, por ejemplo partículas y transparencias. Un valor alto hace que el resultado dependa más de las muestras actuales. No es una máscara de calidad genérica: sobreutilizarla destruye la acumulación que permite reconstruir detalles finos. AMD recomienda calibrarla y explica que incluso una máscara automática tiene límites.
+
+Una integración conceptual con la API de FSR 2 debe rellenar su estructura de dispatch con recursos, dimensiones, deltaTime, jitterOffset, motionVectorScale y cameraReset. Los nombres y tipos exactos varían entre generaciones del SDK: conviene utilizar el encabezado de la versión instalada y no mezclar ejemplos de FSR 2.0 con versiones posteriores. El código del SDK y su manual son la referencia autoritativa.
+
+** TSR: rechazo de historia como problema central
+
+Epic documenta que Unreal TSR combina acumulación, heurísticas de paralaje, rechazo de sombreado, análisis de flicker y mecanismos de recuperación de historia. Son componentes que responden a problemas diferentes. Una heurística de paralaje intenta reconocer disoclusiones; una de shading rejection detecta cambios que no quedan explicados por el movimiento geométrico; el análisis de flicker trata patrones que alternan entre fotogramas y podrían desaparecer por un rechazo excesivo.
+
+La documentación actual también describe /history resurrection/, que conserva información más antigua para recuperarla cuando vuelve a ser útil. Esto no significa que un fotograma antiguo sea siempre más correcto: aumenta la capacidad de estabilizar ciertos detalles, pero exige criterios de validez adicionales y consume memoria. Las opciones y el comportamiento concreto evolucionan entre versiones de Unreal Engine; debemos distinguir la idea arquitectónica de una configuración específica.
+
+** Comparación honesta
+
+Un reescalado bilineal es barato y no introduce estelas, pero no puede aprovechar muestras de otros fotogramas. TAA a resolución nativa reduce aliasing temporal y puede suavizar detalles. El temporal upscaling permite reducir el coste de sombreado a cambio de memoria, cómputo de reconstrucción y complejidad de integración. Las soluciones basadas en aprendizaje automático pueden emplear modelos entrenados para la reconstrucción, pero su rendimiento y compatibilidad dependen del hardware y de la implementación; no debemos asumir que un algoritmo es superior en todas las escenas.
+
+FSR 2 y TSR son referencias especialmente útiles para estudiar la reconstrucción temporal porque AMD publica documentación y código del SDK y Epic documenta sus heurísticas. Sus diseños no son intercambiables sin más. Cada uno asume contratos concretos de velocidades, exposición, jitter, buffers y orden de pases.
+
+* Limitaciones: información ausente y errores que no desaparecen
+
+La principal limitación es informativa. Si una superficie no ha sido muestreada, el historial no contiene su detalle. Si una partícula aparece un único fotograma, acumularla con historia introduce fantasmas. Si un reflejo se desplaza de forma distinta a la geometría que lo soporta, los motion vectors del objeto no describen su movimiento aparente. Si una textura animada cambia de fase, la reproyección geométrica no reconstruye el sombreado anterior.
+
+Hay además limitaciones de ingeniería. Los vectores de movimiento requieren acceso a transformaciones previas y a animación anterior; el historial ocupa memoria; el cálculo de exposición puede variar entre fotogramas; y los cambios de resolución dinámica necesitan ajustar coordenadas y patrones de jitter. Los pases de postproceso realizados antes o después del escalador cambian la apariencia final. Por ejemplo, la interfaz de usuario suele dibujarse después de la reconstrucción para mantener texto nítido.
+
+El escalador tampoco debe confundirse con generación de fotogramas. La reconstrucción temporal produce un fotograma de salida a partir de un fotograma actual y datos históricos. La interpolación o generación de fotogramas produce imágenes adicionales entre instantes de simulación; utiliza información relacionada, pero resuelve un problema diferente y tiene implicaciones distintas para latencia y entrada del usuario.
+
+* Laboratorio propuesto: medir estabilidad, no solo FPS
+
+Implementa primero el shader mínimo de acumulación y comprueba una escena estática. Añade Halton, después velocidades de cámara, luego velocidades por objeto. Registra capturas de un giro de 90 grados. Incorpora rechazo de historia por profundidad reconstruida y finalmente clamping por vecindario. Repite las pruebas con transparencia y objetos que salen de detrás de una pared.
+
+En cada fase guarda tiempo GPU, resolución interna, consumo de memoria y capturas de secuencia. Mide tres métricas separadas: nitidez en escena estática, estabilidad durante movimiento lento y ghosting al revelar superficies. Para una comparación justa, conserva el mismo jitter y los mismos fotogramas de entrada. El resultado más instructivo suele ser ver cómo una modificación que mejora una métrica empeora otra.
+
+Si quieres acercarte a una implementación real, integra FSR 2 como referencia y compara su salida con el prototipo. La diferencia visual no será atribuible a un único filtro: proviene de la interacción entre validación histórica, tratamiento de máscaras, reconstrucción espacial, compensación de exposición y estabilización.
+
+* Conclusión: el pasado como recurso gráfico
+
+La reconstrucción temporal cambia nuestra forma de pensar el presupuesto de renderizado. Ya no preguntamos únicamente cuántos píxeles dibuja la GPU hoy, sino qué información conserva de fotogramas anteriores y si puede transportarla correctamente al presente. Jitter aporta nuevas posiciones de muestreo; los motion vectors identifican correspondencias; la profundidad y el análisis de sombreado deciden cuándo la historia deja de ser válida; la acumulación convierte observaciones dispersas en una imagen estable.
+
+El coste es una arquitectura más delicada y una nueva familia de artefactos. Precisamente por eso conviene estudiar primero un algoritmo sencillo, observar sus fallos y añadir cada mecanismo con una justificación medible. La evolución desde el supersampling clásico hasta FSR 2 y TSR muestra que una de las optimizaciones más importantes de los gráficos modernos no consiste en dibujar más, sino en descartar menos información útil.
+
+* Fuentes originales y lecturas recomendadas
+
+- [[https://www.youtube.com/watch?v=yNQ47MY-Eo0][Brian Karis, /High Quality Temporal Supersampling/, presentación de Epic/Unreal Engine en SIGGRAPH 2014]]. Fuente primaria histórica; vídeo de la presentación técnica.
+- [[https://gpuopen.com/manuals/fidelityfx_sdk/techniques/super-resolution-temporal/][AMD GPUOpen, /FidelityFX Super Resolution 2: Temporal Upscaling/]]. Manual oficial con jitter, vectores de movimiento, máscaras, resolución y ejemplos de integración.
+- [[https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/main/Kits/FidelityFX/docs/techniques/super-resolution-temporal.md][AMD, documentación y código fuente del FidelityFX SDK]]. Repositorio oficial; consultar la versión concreta usada por el proyecto.
+- [[https://dev.epicgames.com/documentation/en-us/unreal-engine/temporal-super-resolution-in-unreal-engine][Epic Games, /Temporal Super Resolution in Unreal Engine/]]. Documentación oficial de historia, paralaje, rechazo y flicker.
+- [[https://dev.epicgames.com/documentation/en-us/unreal-engine/temporal-super-resolution-frequently-asked-questions-for-unreal-engine][Epic Games, /Temporal Super Resolution FAQ/]]. Explica compromisos entre clamping, mezcla y ghosting.
+- [[https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html][Khronos Group, /Vulkan Specification/]]. Fuente normativa de layouts, sincronización y acceso a imágenes en compute.
+
+Estas referencias distinguen una presentación técnica histórica, documentación de implementaciones consolidadas y una especificación de API. Los ejemplos de este capítulo son didácticos y no reproducen código propietario de terceros.
