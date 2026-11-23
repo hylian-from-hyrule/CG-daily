@@ -4,6 +4,7 @@
 
 * 2026
 ** Noviembre
+- <2026-11-23 Mon> [[file:articulos/2026/11/2026-11-23-doom3-volumenes-sombra-stencil.org][DOOM 3 y los volúmenes de sombra: siluetas, stencil y Carmack's reverse]] :historia:retro:doom3:sombras:opengl:
 - <2026-11-22 Sun> [[file:articulos/2026/11/2026-11-22-temporal-upscaling-reproyeccion-historia.org][Temporal upscaling: reconstruir píxeles con historia, movimiento y jitter]] :moderno:gpu:temporal:upscaling:
 - <2026-11-21 Sat> [[file:articulos/2026/11/2026-11-21-n64-tmem-texturas-tiles.org][Nintendo 64 y los 4 KiB de TMEM: texturas, tiles y el coste oculto de cambiar de material]] :historia:retro:n64:rdp:texturas:
 - <2026-11-20 Fri> [[file:articulos/2026/11/2026-11-20-bindless-descriptor-indexing.org][Bindless y descriptor indexing: cómo alimentar una GPU con millones de materiales]] :moderno:gpu:vulkan:bindless:
