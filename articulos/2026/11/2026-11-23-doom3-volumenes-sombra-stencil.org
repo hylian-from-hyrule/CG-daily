@@ -1,0 +1,362 @@
+#+TITLE: DOOM 3 y los volúmenes de sombra: siluetas, stencil y Carmack's reverse
+#+DATE: <2026-11-23 Mon>
+#+LANGUAGE: es
+#+OPTIONS: toc:3 num:t
+#+STARTUP: overview
+#+KEYWORDS: DOOM 3, shadow volumes, stencil buffer, z-fail, OpenGL, historia, 2004
+#+FILETAGS: :historia:retro:doom3:sombras:opengl:
+
+* Introducción: cuando las sombras eran geometría
+
+En 2004, DOOM 3 apostó por una iluminación muy diferente de la habitual en los motores de finales de los noventa. En vez de limitarse a luces precalculadas sobre el escenario, cada linterna y cada lámpara podían alterar dinámicamente el aspecto de paredes, personajes y objetos. Su estética de corredores oscuros, luces intermitentes y sombras recortadas no era solamente una decisión artística: expresaba una elección de arquitectura del renderizador.
+
+Una de sus piezas más conocidas eran los /stencil shadow volumes/: sólidos geométricos invisibles que delimitaban la región del espacio a la que una luz no podía llegar. El motor no necesitaba dibujar ese sólido en pantalla; lo rasterizaba para modificar un contador por píxel en el /stencil buffer/. Después iluminaba solamente los píxeles cuyo contador indicaba que estaban fuera de la sombra.
+
+La idea es anterior a DOOM 3. Frank Crow describió el enfoque de volúmenes de sombra en 1977, y durante los años noventa y primeros 2000 se investigaron variantes adaptadas al hardware. La técnica /depth-fail/, popularmente llamada /Carmack's reverse/, solucionó un problema práctico especialmente molesto: ¿qué sucede cuando la cámara está dentro de una sombra o el plano cercano corta el volumen?
+
+Este capítulo reconstruye el algoritmo desde sus fundamentos geométricos hasta un esqueleto de implementación OpenGL. No pretende reproducir literalmente el código del juego: los fragmentos son ejemplos didácticos independientes. La referencia histórica concreta es DOOM 3, mientras que la edición BFG publicada posteriormente sirve como fuente de código accesible; no debemos confundir ambas versiones.
+
+* El problema: decidir qué fragmentos reciben una luz
+
+Supongamos una escena con una luz puntual L, una caja que la bloquea y una pared detrás. Para un punto visible P de la pared, la condición ideal de iluminación directa es sencilla: el segmento entre P y L no debe atravesar ninguna superficie opaca.
+
+Formalmente, si r(t)=P+t(L-P), con 0<t<1, definimos la visibilidad V(P,L):
+
+\[
+V(P,L)=\begin{cases}
+1 & \text{si no hay intersecciones en }(0,1),\\
+0 & \text{si hay una intersección opaca.}
+\end{cases}
+\]
+
+La luz directa puede escribirse, de forma esquemática, como
+
+\[
+C(P)=C_{amb}(P)+\sum_{i=1}^{N}V(P,L_i)\,C_i(P).
+\]
+
+El término C_i incorpora la intensidad, atenuación, normal y material. La dificultad está en evaluar V para muchos puntos visibles, luces y obstáculos a 60 fotogramas por segundo con las GPU de aquella época.
+
+Una solución es el /shadow mapping/: representar la profundidad desde el punto de vista de la luz y comparar distancias. Otra consiste en calcular la región geométrica completa que queda oculta para esa luz. Esta última es la filosofía de los volúmenes de sombra.
+
+** Por qué no bastaba con una sombra pintada
+
+Una textura de luz precalculada resulta económica y estable, pero no responde naturalmente al desplazamiento de una puerta, un monstruo o una lámpara. Un /blob shadow/ bajo los personajes comunica contacto con el suelo, pero no reproduce una sombra que trepa por la pared o se deforma sobre una escalera.
+
+Los volúmenes permiten sombras duras exactas respecto de la malla poligonal del oclusor y del punto de luz idealizado. Esa precisión tiene un precio: la silueta debe reconstruirse para cada relación relevante entre luz y objeto, y la geometría resultante puede cubrir muchos píxeles.
+
+* Construir el volumen a partir de una silueta
+
+Consideremos una malla cerrada de triángulos. Cada triángulo tiene una normal geométrica N y un punto A. Para una luz puntual L, una cara está orientada hacia la luz cuando
+
+\[
+N\cdot(L-A)>0.
+\]
+
+Este signo presupone normales exteriores y un orden de vértices consistente. Una arista compartida por una cara orientada hacia la luz y otra orientada en sentido contrario pertenece a la silueta vista desde L.
+
+Si la arista tiene extremos A y B, prolongamos ambos vértices alejándolos de la luz:
+
+\[
+A'(t)=L+t(A-L),\qquad B'(t)=L+t(B-L),\quad t>1.
+\]
+
+Los cuatro puntos A, B, B'(t), A'(t) forman un cuadrilátero lateral. Al repetirlo para cada arista de silueta obtenemos una especie de tubo o cono irregular.
+
+** Un ejemplo numérico
+
+Imaginemos una luz L=(0,3,0) y un vértice A=(1,1,0). La dirección que sale de la luz hacia el vértice es A-L=(1,-2,0). Con t=6, la posición extruida es A'=(6,-9,0). La arista correspondiente a otro vértice B=(2,1,0) se convierte en una pared de sombra que se ensancha según aumenta la distancia.
+
+Esto no es una proyección 2D de una silueta sobre un plano fijo: es un sólido 3D. Una misma pared lateral puede intersectar suelo, escalones, personajes y otras superficies. El hardware rasteriza esas intersecciones contra el Z-buffer ya existente.
+
+** El papel de las tapas
+
+Los laterales por sí solos no siempre forman un volumen cerrado. Necesitamos una /light cap/ cercana al oclusor, formada por caras orientadas hacia la luz, y una /dark cap/ al fondo. En un volumen idealmente infinito, esta última puede construirse con vértices en el infinito proyectivo.
+
+La necesidad de las tapas depende de cómo contemos las intersecciones. Una optimización válida para un recorrido de cámara a superficie puede omitirlas bajo ciertas condiciones; un recorrido desde la superficie hacia el infinito exige que el volumen esté correctamente cerrado.
+
+** Topología: el enemigo invisible
+
+La definición anterior supone una malla cerrada, orientable y con aristas compartidas de manera coherente. En una malla abierta, una arista de frontera carece de la segunda cara necesaria para determinar si es silueta. En una malla no-manifold pueden existir tres o más caras incidentes.
+
+Un renderizador robusto necesita una fase de preparación: soldar vértices geométricamente coincidentes cuando corresponda, construir adyacencias, verificar la orientación y detectar agujeros. Los vértices duplicados para UV o normales no deberían romper la conectividad geométrica usada para las sombras.
+
+* Implementación C++: descubrir aristas de silueta
+
+Primero podemos construir una tabla de aristas no dirigidas. La clave almacena el par de índices ordenados, pero también conservamos la orientación de cada aparición para generar después los triángulos con /winding/ correcto.
+
+#+begin_src cpp
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
+struct Vec3 { float x, y, z; };
+Vec3 operator-(Vec3 a, Vec3 b) {
+    return {a.x-b.x, a.y-b.y, a.z-b.z};
+}
+float dot(Vec3 a, Vec3 b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+Vec3 cross(Vec3 a, Vec3 b) {
+    return {a.y*b.z-a.z*b.y,
+            a.z*b.x-a.x*b.z,
+            a.x*b.y-a.y*b.x};
+}
+struct EdgeKey {
+    uint32_t lo, hi;
+    bool operator==(const EdgeKey&) const = default;
+};
+struct Hash {
+    size_t operator()(EdgeKey e) const {
+        return (uint64_t(e.lo) << 32) | e.hi;
+    }
+};
+struct EdgeUse { uint32_t a, b, face; };
+using Adjacency =
+    std::unordered_map<EdgeKey, std::vector<EdgeUse>, Hash>;
+
+Adjacency buildAdjacency(
+    const std::vector<std::array<uint32_t,3>>& tris) {
+    Adjacency result;
+    for (uint32_t f = 0; f < tris.size(); ++f) {
+        for (int k = 0; k < 3; ++k) {
+            uint32_t a = tris[f][k];
+            uint32_t b = tris[f][(k+1)%3];
+            result[{std::min(a,b), std::max(a,b)}]
+                .push_back({a,b,f});
+        }
+    }
+    return result;
+}
+#+end_src
+
+La tabla cuesta memoria adicional, pero puede construirse al cargar el modelo. Para un objeto deformable es posible reutilizar la conectividad y actualizar únicamente la clasificación de sus caras.
+
+Ahora clasificamos los triángulos con respecto a una luz en espacio de objeto. Debemos transformar la luz al mismo espacio que los vértices; mezclar posiciones mundiales con normales locales es un error frecuente.
+
+#+begin_src cpp
+std::vector<bool> lightFacing(
+    const std::vector<Vec3>& vertices,
+    const std::vector<std::array<uint32_t,3>>& tris,
+    Vec3 lightObjectSpace) {
+    std::vector<bool> front(tris.size());
+    for (size_t f = 0; f < tris.size(); ++f) {
+        auto [ia, ib, ic] = tris[f];
+        Vec3 a = vertices[ia], b = vertices[ib], c = vertices[ic];
+        Vec3 n = cross(b-a, c-a);
+        front[f] = dot(n, lightObjectSpace-a) > 0.0f;
+    }
+    return front;
+}
+#+end_src
+
+Para una arista con exactamente dos caras, si =front[f0] != front[f1]=, añadimos su cuadrilátero extruido. La orientación final de sus triángulos depende del orden de la arista en la cara frontal y de la convención de caras del renderizador. Es mejor verificarlo con un modelo de prueba y /back-face culling/ que ocultar ese detalle en una función genérica.
+
+En producción también debemos tratar los triángulos degenerados, el caso de luz coplanar y los bordes de mallas abiertas. La igualdad exacta con cero no es una política geométrica estable cuando las posiciones cambian ligeramente.
+
+* Extrusión al infinito con coordenadas homogéneas
+
+Extruir a una distancia enorme, como diez mil unidades, parece suficiente hasta que una luz, la cámara o un escenario exceden esa escala. Además, el plano lejano de recorte puede cortar el volumen y dejarlo abierto.
+
+Las coordenadas homogéneas permiten expresar un punto en el infinito usando w=0. Un vértice finito A se representa como (Ax,Ay,Az,1). Para una luz puntual L, la dirección de extrusión es A-L, y el extremo infinito puede representarse como
+
+\[
+E_{\infty}=(A_x-L_x,\ A_y-L_y,\ A_z-L_z,\ 0).
+\]
+
+No es un punto euclídeo que podamos dividir por w. Es una dirección proyectiva. El vertex shader la multiplica por las matrices de vista y proyección sin realizar una división manual previa.
+
+#+begin_src glsl
+#version 330 core
+layout(location=0) in vec3 position;
+layout(location=1) in float extruded;
+uniform mat4 modelViewProjection;
+uniform vec3 lightObjectSpace;
+
+void main() {
+    vec4 p = (extruded > 0.5)
+        ? vec4(position - lightObjectSpace, 0.0)
+        : vec4(position, 1.0);
+    gl_Position = modelViewProjection * p;
+}
+#+end_src
+
+Este shader es un componente ilustrativo: para crear las tapas y los laterales todavía hay que preparar correctamente los índices y duplicar o seleccionar las dos variantes de cada vértice.
+
+La técnica requiere una proyección compatible con geometría al infinito, habitualmente una matriz de perspectiva con plano lejano infinito o una estrategia equivalente. No basta con asignar w=0 si el recorte y la convención de profundidad siguen suponiendo un plano lejano finito.
+
+* El stencil buffer como contador geométrico
+
+Un buffer de stencil suele ofrecer ocho bits por píxel y comparte frecuentemente un formato de profundidad/stencil, como D24S8 o D32F_S8. Cada fragmento generado por el volumen puede incrementar o decrementar el valor de stencil según la orientación de su cara y el resultado del test de profundidad.
+
+El truco fundamental es una propiedad de los sólidos cerrados: si un rayo parte del exterior, cada entrada en el volumen tiene una salida correspondiente. Si termina dentro, la cuenta de entradas y salidas no se cancela.
+
+Podemos definir, con una orientación elegida de forma consistente,
+
+\[
+S(P)=\#\mathrm{entradas}-\#\mathrm{salidas}.
+\]
+
+Para una malla cerrada orientada correctamente, un contador no nulo identifica una posición en sombra. En escenas con múltiples volúmenes superpuestos, las contribuciones se acumulan; no necesitamos una máscara booleana separada por objeto.
+
+** Z-pass: contar desde el ojo
+
+En el enfoque /depth-pass/ o /z-pass/, actualizamos stencil cuando un fragmento del volumen supera el test de profundidad. Esto equivale a contar las caras que aparecen entre la cámara y la primera superficie visible. Con la convención de orientación del ejemplo de GPU Gems, se incrementan las caras frontales y se decrementan las posteriores.
+
+Si el ojo está fuera de todos los volúmenes relevantes y no se producen recortes problemáticos, la clasificación es correcta. Pero imaginemos una cámara dentro de la sombra de una columna: el rayo empieza ya dentro del volumen. La cuenta carece de una entrada inicial y puede terminar con cero donde debería indicar sombra.
+
+Un plano cercano que secciona el volumen produce una variante del mismo problema: desaparecen intersecciones necesarias para equilibrar el contador.
+
+** Z-fail: contar desde la superficie hacia el infinito
+
+/Carmack's reverse/ invierte el criterio: actualizamos stencil cuando el fragmento del volumen *falla* el test de profundidad, es decir, cuando está detrás de la superficie visible. Conceptualmente contamos intersecciones desde P hacia el infinito en la dirección de visión opuesta al observador.
+
+Si el volumen está cerrado, podemos empezar fuera de él en el infinito y recuperar correctamente si P está dentro. Por eso z-fail resuelve el caso de la cámara dentro de la sombra, pero exige especial cuidado con las tapas y el plano lejano.
+
+Con la convención de orientación utilizada aquí, las caras frontales decrementan y las posteriores incrementan al fallar profundidad. Cambiar la convención de winding invierte estos signos. La propiedad importante es mantener la misma orientación en toda la geometría.
+
+** ¿Por qué no simplemente comprobar stencil distinto de cero?
+
+Sí: después de procesar los volúmenes de una luz, =stencil == 0= identifica píxeles que pueden recibir su iluminación directa. Pero el valor no codifica qué objeto produjo la sombra ni cuánta luz queda. Es una prueba de visibilidad binaria para esa luz, no una medida de penumbra.
+
+Con ocho bits y operaciones de incremento/decremento con /wrap/, la cuenta puede desbordarse. Normalmente el número de cruces es pequeño, pero en geometrías patológicas o escenas muy superpuestas no hay garantía matemática de ausencia de overflow.
+
+* OpenGL: un pase de sombras reproducible
+
+El pipeline clásico realiza primero un pase de geometría que llena el Z-buffer y dibuja iluminación ambiente. Después, para cada luz, limpia stencil, rasteriza sus volúmenes sin escribir color ni profundidad, y finalmente dibuja la contribución de esa luz solamente donde stencil vale cero.
+
+El siguiente fragmento supone que ya existe un Z-buffer correcto, que las caras de los volúmenes están orientadas consistentemente y que usamos la convención z-fail descrita arriba.
+
+#+begin_src cpp
+// Estado del pase de volumen; ejemplo OpenGL 3.x.
+glEnable(GL_DEPTH_TEST);
+glDepthMask(GL_FALSE);
+glEnable(GL_STENCIL_TEST);
+glStencilMask(0xFF);
+glClearStencil(0);
+glClear(GL_STENCIL_BUFFER_BIT);
+glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+glDisable(GL_CULL_FACE);
+glStencilFunc(GL_ALWAYS, 0, 0xFF);
+
+// glStencilOpSeparate(face, stencilFail, depthFail, depthPass)
+glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_DECR_WRAP, GL_KEEP);
+glStencilOpSeparate(GL_BACK,  GL_KEEP, GL_INCR_WRAP, GL_KEEP);
+
+// drawClosedShadowVolumes(light);
+#+end_src
+
+Hay un detalle fácil de pasar por alto: los argumentos de =glStencilOpSeparate= son, en orden, fallo de stencil, fallo de profundidad y éxito de profundidad. Para z-fail las operaciones de incremento y decremento van en el *segundo* parámetro operativo, no en el último.
+
+Al terminar el volumen, restauramos la escritura de color y configuramos el pase de luz.
+
+#+begin_src cpp
+glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+glStencilMask(0x00);
+glStencilFunc(GL_EQUAL, 0, 0xFF);
+glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+glDepthMask(GL_FALSE);
+glEnable(GL_BLEND);
+glBlendFunc(GL_ONE, GL_ONE);
+glDepthFunc(GL_LEQUAL);
+
+// drawLightContribution(light);
+// Al salir: restaurar blend, depth func, stencil, culling...
+#+end_src
+
+En este segundo pase, el shader calcula la luz directa y la suma aditivamente al color existente. El estado de profundidad debe ser compatible con el pase inicial para evitar que superficies visibles fallen por pequeñas diferencias de Z. En una implementación moderna suele ser preferible reutilizar exactamente la misma profundidad, evitar escrituras innecesarias y gestionar explícitamente los estados.
+
+** Un fotograma con tres luces
+
+Con tres luces, el algoritmo no dibuja una sola máscara global de sombra. Realiza tres clasificaciones distintas: cada luz tiene su propia posición y, por tanto, sus propias siluetas. Si una pared recibe la primera luz pero queda oculta de la segunda, su color final incorpora solamente la contribución visible.
+
+Esta estructura por luz encaja con iluminación aditiva, pero multiplica los costes. Un motor que tenga decenas de luces superpuestas sobre el mismo objeto puede reconstruir y rasterizar muchos volúmenes.
+
+* Costes: geometría, overdraw y memoria
+
+Sea E el número de aristas de silueta de un objeto y F el número de triángulos de sus tapas. Si representamos cada cuadrilátero lateral mediante dos triángulos, la geometría añadida por objeto y luz es aproximadamente
+
+\[
+T_{volumen}\simeq 2E+F_{tapas}.
+\]
+
+Por ejemplo, si un objeto presenta 400 aristas de silueta y sus tapas contienen 1.800 triángulos, generamos unos 2.600 triángulos adicionales para una sola luz. Diez objetos similares afectados por cuatro luces pueden implicar alrededor de 104.000 triángulos de volumen por fotograma, antes de contar la escena visible.
+
+Pero el número de triángulos no cuenta toda la historia. Los lados de un volumen extruido pueden ocupar una porción enorme de pantalla y generar muchos fragmentos, aunque no escriban color. El ancho de banda y la tasa de operaciones depth/stencil pueden convertirse en el cuello de botella.
+
+A 1920x1080 hay 2.073.600 píxeles. Un buffer lógico de stencil de ocho bits contiene unos 2 MiB de datos, pero si se utiliza un formato D24S8 el almacenamiento bruto del attachment combinado ronda 7,9 MiB, sin contar compresión, alineación ni estructuras internas de GPU. No debemos equiparar el tamaño lógico del stencil con el tráfico real de memoria: los múltiples pases y el overdraw pueden multiplicarlo.
+
+** Optimización por scissor y alcance de la luz
+
+Una luz puntual atenuada tiene una región de influencia finita a efectos prácticos. Si su proyección ocupa un rectángulo pequeño de pantalla, podemos limitar el rasterizado mediante /scissor/. También podemos descartar objetos cuya caja envolvente no intersecta el volumen de influencia de la luz.
+
+Sin embargo, no basta con comprobar si el oclusor está dentro del frustum de cámara: un objeto invisible puede proyectar una sombra sobre una pared visible. Hay que distinguir visibilidad del objeto y relevancia de su sombra.
+
+** Elegir z-pass cuando es seguro
+
+Z-pass evita dibujar tapas en situaciones donde la cámara está garantizadamente fuera de los volúmenes y no hay cortes problemáticos. GPU Gems explica pruebas conservadoras para decidirlo por oclusor. La palabra importante es /conservadora/: un falso positivo reduce rendimiento, pero un falso negativo puede generar sombras incorrectas.
+
+Una arquitectura híbrida puede usar z-pass para casos sencillos y z-fail para casos generales. También puede almacenar volúmenes de geometría estática precalculados o explotar estructuras de adyacencia persistentes.
+
+* Shadow volumes frente a shadow maps
+
+Ambas técnicas calculan visibilidad respecto de una luz, pero lo hacen en espacios distintos.
+
+Los shadow maps discretizan la escena desde la luz en una textura de profundidad. Su coste depende de la resolución del mapa, del número de luces y de la geometría que dibujan. Pueden producir aliasing, acne y peter-panning, pero admiten filtrados y extensiones para sombras suaves.
+
+Los volúmenes discretizan la clasificación en la pantalla de la cámara mediante stencil. Sus contornos son exactos para la silueta poligonal rasterizada, sin resolución de mapa de sombra, pero la complejidad depende de la silueta, de la cantidad de luces y del overdraw. La geometría alfa-recortada, como hojas representadas por un quad con transparencia, no proyecta su silueta visual exacta salvo que se modele de otro modo.
+
+| Propiedad | Volúmenes stencil | Shadow mapping |
+|-----------+-------------------+----------------|
+| Contorno | Duro, ligado a la malla | Dependiente de resolución y filtrado |
+| Memoria principal | Depth/stencil y geometría | Texturas de profundidad |
+| Coste dominante | Siluetas, pases, overdraw | Render desde la luz, muestreo |
+| Geometría alfa | Difícil sin representación adicional | Posible con alpha test |
+| Sombras suaves | Requieren técnicas adicionales | PCF, VSM y otras variantes |
+| Cámara dentro de sombra | Z-fail con volumen cerrado | No es el mismo problema |
+
+Los motores actuales suelen combinar mapas de sombra, ray tracing, técnicas de pantalla y cachés espaciales. No significa que los volúmenes sean conceptualmente obsoletos: continúan siendo una excelente herramienta para comprender topología, rasterización, stencil y visibilidad geométrica.
+
+* Qué enseñó DOOM 3 a los motores posteriores
+
+DOOM 3 fue una demostración de que un motor podía organizar su iluminación alrededor de interacciones dinámicas por luz y objeto. El estilo visual surgía de un compromiso: sombras nítidas y consistentes, a cambio de costes significativos en geometría y fill-rate, y de una representación de luces que tendía a producir contornos muy duros.
+
+El código liberado de DOOM 3 BFG conserva estructuras y conceptos útiles para estudiar las interacciones de luz, aunque la versión BFG introdujo cambios respecto al motor original de 2004. La documentación técnica de la época, en especial el capítulo de Morgan McGuire en GPU Gems, describe con precisión las variantes de conteo, las tapas y las optimizaciones.
+
+Hay también una lección de diseño de API: el stencil buffer, que parece un pequeño accesorio del Z-buffer, permite expresar una prueba geométrica compleja mediante operaciones de rasterización y contadores enteros. No hace falta que un fragment shader calcule explícitamente todas las intersecciones de un rayo.
+
+* Laboratorio: construir un renderizador de sombras de 2004
+
+Una implementación educativa puede comenzar con una caja cerrada, un plano receptor, una luz puntual y una cámara móvil. Primero dibujamos el Z-buffer y un color ambiente. Después calculamos adyacencias, clasificamos caras y dibujamos los laterales del volumen con colores de depuración, antes de activar stencil.
+
+El siguiente paso es implementar z-pass y mover la cámara dentro de la sombra para observar el fallo. Luego añadimos tapas, extrusión homogénea y z-fail, verificando que el resultado permanezca correcto al cruzar la región oscura.
+
+Para medir rendimiento conviene variar independientemente el número de luces, la cantidad de aristas de silueta, la resolución de pantalla y la proximidad de la cámara a los volúmenes. Las consultas de tiempo GPU (=GL_TIME_ELAPSED=) permiten separar la generación en CPU del coste de rasterización, aunque hay que sincronizar y promediar las medidas con cuidado.
+
+Una prueba adicional interesante es introducir un agujero en la malla de la caja y observar cómo falla la clasificación. Esa experiencia muestra por qué un algoritmo geométricamente elegante depende tanto de las garantías topológicas de sus datos.
+
+** Extensión moderna
+
+Se puede reconstruir el mismo experimento en Vulkan con un attachment de profundidad/stencil, pipelines con operaciones stencil diferentes para caras frontales y posteriores, y pases de iluminación aditivos. La sincronización de attachments y las transiciones de layout deben especificarse correctamente; el principio matemático sigue siendo el mismo.
+
+Otra variante consiste en comparar contra un shadow map de 1024x1024: medir tiempo GPU, memoria, calidad de contornos y comportamiento al alejar la cámara. La comparación debe hacerse en escenas equivalentes y con un criterio explícito de calidad, no solo contando llamadas de dibujo.
+
+* Conclusiones
+
+Los volúmenes de sombra convierten la pregunta «¿puede la luz alcanzar este punto?» en otra: «¿cuántas veces cruza un rayo la frontera de un sólido?». La silueta del oclusor define esa frontera, el hardware rasteriza sus caras y el stencil buffer conserva el balance de entradas y salidas.
+
+Z-pass es económico cuando la cámara está fuera de las sombras relevantes; z-fail resuelve casos más generales contando desde la superficie hacia el infinito, siempre que el volumen esté cerrado y la proyección no lo recorte indebidamente. La corrección geométrica, la topología de la malla y los estados de profundidad importan tanto como el código.
+
+El legado técnico de DOOM 3 no es que todos los motores deban volver a los volúmenes stencil. Es haber mostrado cómo una restricción de hardware puede transformarse en una arquitectura completa de iluminación, con decisiones visibles tanto en el rendimiento como en la estética del juego.
+
+* Referencias y lecturas originales
+
+- Frank C. Crow, «Shadow Algorithms for Computer Graphics», SIGGRAPH 1977, artículo fundacional sobre sombras geométricas: [[https://doi.org/10.1145/563858.563901][ACM / DOI]].
+- Morgan McGuire, «Efficient Shadow Volume Rendering», capítulo 9 de /GPU Gems/, NVIDIA, 2004; exposición primaria del algoritmo, z-pass, z-fail y optimizaciones: [[https://developer.nvidia.com/gpugems/gpugems/part-ii-lighting-and-shadows/chapter-9-efficient-shadow-volume-rendering][NVIDIA Developer]].
+- id Software, código fuente de /DOOM 3 BFG Edition/, publicado bajo GPL con condiciones adicionales; fuente primaria de implementación posterior al juego original: [[https://github.com/id-Software/DOOM-3-BFG][Repositorio oficial]].
+- Khronos Group, referencia oficial de =glStencilOpSeparate= y estado stencil en OpenGL: [[https://registry.khronos.org/OpenGL-Refpages/gl4/html/glStencilOpSeparate.xhtml][OpenGL Reference Pages]].
+- Khronos Group, especificación OpenGL 4.6, capítulos de pruebas de fragmentos, profundidad y stencil: [[https://registry.khronos.org/OpenGL/specs/gl/glspec46.core.pdf][Especificación oficial PDF]].
+
+Las ecuaciones y los fragmentos de código de este artículo son explicaciones y ejemplos propios; no se han copiado figuras ni código de terceros.
