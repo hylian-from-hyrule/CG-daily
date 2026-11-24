@@ -1,0 +1,341 @@
+#+TITLE: ReSTIR: cómo elegir una luz entre millones mediante reservorios
+#+DATE: 2026-11-24
+#+LANGUAGE: es
+#+FILETAGS: :moderno:gpu:raytracing:restir:montecarlo:
+
+* De las luces de DOOM 3 a las escenas con millones de emisores
+
+En el capítulo anterior estudiamos los volúmenes de sombra. Una característica de aquel modelo de iluminación era que cada luz podía requerir trabajo adicional sobre una parte considerable de la escena. En una habitación con tres lámparas esto es razonable. En una ciudad nocturna, con ventanas, carteles luminosos y superficies emisivas, la situación cambia radicalmente. Si cada triángulo de una pantalla publicitaria puede emitir luz, el número de fuentes deja de ser una pequeña constante controlada por el diseñador.
+
+El trazado de rayos acelerado por hardware, incorporado a las APIs de consumo a partir de 2018, permite consultar si un segmento entre una superficie y una fuente luminosa está obstruido. Pero no resuelve por sí mismo la pregunta de qué segmento merece ser consultado. Un acelerador de intersecciones no es un algoritmo de integración de iluminación. Incluso una consulta muy rápida resulta cara cuando se multiplica por millones de píxeles y fuentes.
+
+En SIGGRAPH 2020, Bitterli y colaboradores publicaron ReSTIR, una técnica que combina selección ponderada de muestras, reutilización espacial y reutilización temporal. Su idea esencial es conservar una pequeña representación de muchas propuestas de iluminación y compartirla entre puntos que probablemente tienen necesidades parecidas. No es un filtro de imagen: opera sobre las decisiones aleatorias que preceden al cálculo de la iluminación.
+
+Este capítulo se centra en iluminación directa, o ReSTIR DI. Las extensiones a iluminación indirecta y caminos completos son problemas relacionados pero diferentes. Construiremos primero un estimador elemental que se puede ejecutar en CPU, después estudiaremos cómo convertirlo en un conjunto de pases de GPU y finalmente veremos qué condiciones hacen que la reutilización sea correcta o introduzca sesgo.
+
+* El problema matemático: integrar antes de dibujar
+
+** Una superficie y una fuente de área
+
+Consideremos un punto visible x, una normal n y una dirección de observación. Una muestra y pertenece a una superficie emisora. La dirección de iluminación es el vector unitario que va de x a y. Para una fuente difusa de área, la contribución RGB de esa muestra puede escribirse como:
+
+\[
+ F_x(y)=L_e(y)\,f_r(x,\omega_i,\omega_o)\,
+ \frac{\max(0,n_x\cdot\omega_i)
+ \max(0,n_y\cdot(-\omega_i))}{\|y-x\|^2}\,V(x,y).
+\]
+
+Aquí L_e es la radiancia emitida, f_r es la BRDF, y V vale uno cuando el segmento está libre y cero cuando existe un obstáculo opaco. La fracción es el término geométrico. La segunda normal pertenece al emisor, no al receptor. Para un emisor de doble cara hay que adaptar el coseno correspondiente.
+
+La iluminación directa es la integral de F sobre la unión de las superficies emisoras. Si hay N luces, podemos considerar el dominio como N regiones separadas. Primero elegimos una región y después un punto dentro de ella. Esto evita confundir una probabilidad discreta de seleccionar una lámpara con una densidad continua de seleccionar una posición sobre su superficie.
+
+Para una luz puntual el dominio es discreto y la expresión cambia: no existe un área emisora sobre la que integrar. Su intensidad radiante y el inverso del cuadrado de la distancia sustituyen al término correspondiente. En un motor real es posible mezclar ambos tipos, siempre que cada muestra conserve información sobre su medida y su densidad.
+
+** Monte Carlo y la importancia de la distribución
+
+Si generamos M muestras independientes con densidad q, un estimador elemental es:
+
+\[
+ \widehat L=\frac{1}{M}\sum_{i=1}^{M}
+ \frac{F_x(y_i)}{q(y_i)}.
+\]
+
+La razón de dividir por q es que la esperanza de una función de una variable aleatoria se obtiene integrando esa función multiplicada por su densidad. Al sustituir F/q, la densidad se cancela. La condición fundamental es que q sea positiva donde F contribuya a la integral.
+
+La esperanza coincide con la integral, pero eso no garantiza una imagen agradable. Para una componente escalar, la varianza del promedio independiente es:
+
+\[
+ \operatorname{Var}(\widehat L)=\frac{1}{M}
+ \left(\int \frac{F_x(y)^2}{q(y)}\,dy-L^2\right).
+\]
+
+Si q asigna una probabilidad diminuta a una contribución grande, aparece una muestra excepcionalmente brillante. Es el origen de muchos de los puntos luminosos aislados que observamos en imágenes Monte Carlo. Aumentar M reduce la varianza, pero exige más trabajo. Una distribución de importancia adecuada puede reducirla sin aumentar el número de rayos.
+
+La distribución ideal para una función escalar positiva sería proporcional a F. En ese caso todas las muestras tendrían el mismo peso y la varianza desaparecería. Desafortunadamente, construir esa distribución exige conocer la función que estamos intentando integrar, incluida la visibilidad. La solución práctica consiste en aproximarla con una función más barata.
+
+* Seleccionar candidatos sin almacenar una lista
+
+** Una distribución objetivo no normalizada
+
+Definimos una función escalar positiva p que aproxima la importancia de una muestra para el punto actual. Por ejemplo, la luminancia de F sin el término de visibilidad. Eliminar la visibilidad permite evaluar numerosos candidatos sin lanzar rayos de sombra. La función p no necesita integrar uno y tampoco tiene que coincidir exactamente con la contribución RGB.
+
+Generamos candidatos desde q y asignamos a cada uno un peso w:
+
+\[
+ w_i=\frac{p(y_i)}{q(y_i)},\qquad
+ S=\sum_i w_i.
+\]
+
+Queremos conservar un candidato con probabilidad w_i/S. Una solución trivial almacena todos los candidatos, construye una suma acumulada y selecciona uno al final. En una GPU esto consume registros o memoria y obliga a recorrer la lista. Un reservorio ponderado consigue la misma distribución condicional con espacio constante.
+
+Al recibir el candidato i, sumamos su peso al acumulador S. Sustituimos el candidato conservado por el nuevo con probabilidad w_i/S. Si no lo sustituimos, el anterior permanece. Solo necesitamos guardar la muestra seleccionada, la suma de pesos y el número de propuestas.
+
+** Demostración por inducción
+
+Supongamos que tras k candidatos la probabilidad de conservar j es w_j/S_k. Al llegar el siguiente candidato, la probabilidad de no sustituirlo es S_k/S_{k+1}. Por tanto, la probabilidad de que j sobreviva es:
+
+\[
+ \frac{w_j}{S_k}\frac{S_k}{S_{k+1}}
+ =\frac{w_j}{S_{k+1}}.
+\]
+
+El candidato nuevo tiene precisamente probabilidad w_{k+1}/S_{k+1}. El caso inicial es inmediato si el primer peso es positivo. Los candidatos de peso cero no pueden ser seleccionados, aunque cuentan como propuestas si pertenecen al experimento original.
+
+Imaginemos cuatro pesos: 1, 2, 9 y 4. El acumulador final vale 16. El tercer candidato tiene probabilidad 9/16 de sobrevivir, aunque no sabemos en qué momento se generará ni necesitamos guardar los otros tres. El resultado no es el máximo determinista. Conservar siempre el máximo eliminaría parte de la distribución y alteraría el estimador.
+
+** Un estimador a partir de una sola muestra
+
+Sea Y el candidato seleccionado. Definimos el peso final del reservorio:
+
+\[
+ W=\frac{S}{M\,p(Y)}.
+\]
+
+La contribución estimada es F(Y)W. Condicionando respecto a la lista de candidatos, obtenemos:
+
+\[
+ E[F(Y)W\mid y_1,\ldots,y_M]
+ =\sum_i\frac{w_i}{S}
+ \frac{F(y_i)S}{M p(y_i)}
+ =\frac{1}{M}\sum_i\frac{F(y_i)}{q(y_i)}.
+\]
+
+Tomando la esperanza sobre la generación de candidatos recuperamos la integral. Esta demostración explica por qué el peso final no es opcional. Seleccionar una luz brillante y devolver directamente su radiancia produce una imagen que puede parecer plausible pero no corresponde al estimador original.
+
+También explica una ventaja práctica: podemos evaluar la visibilidad únicamente para Y. Los M candidatos necesitan una estimación barata de importancia, mientras que el seleccionado recibe la evaluación completa. La selección añade su propia varianza; no equivale a evaluar M contribuciones completas. El beneficio se mide a igualdad de tiempo, no a igualdad de candidatos.
+
+* Un laboratorio C++ antes de tocar la GPU
+
+El siguiente programa conceptual usa luces discretas y una distribución uniforme. El vector de contribuciones contiene el valor exacto que queremos sumar. El vector de objetivos contiene una aproximación positiva. No hay geometría todavía: la intención es aislar el comportamiento estadístico y verificarlo antes de introducir rayos.
+
+#+begin_src cpp
+#include <vector>
+#include <random>
+#include <cstdint>
+#include <iostream>
+#include <cmath>
+
+struct Reservoir {
+    uint32_t id = 0;
+    double sum = 0;
+    uint32_t M = 0;
+    bool valid = false;
+
+    void update(uint32_t candidate, double w,
+                double u) {
+        ++M;
+        if (!(w > 0)) return;
+        sum += w;
+        if (u * sum < w) {
+            id = candidate;
+            valid = true;
+        }
+    }
+};
+
+int main() {
+    std::vector<double> f{0, 2, 40, 1, 0, 8};
+    std::vector<double> p{1, 2, 30, 1, 3, 8};
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<double> u(0, 1);
+    std::uniform_int_distribution<uint32_t>
+        pick(0, uint32_t(f.size()-1));
+
+    constexpr int trials = 100000;
+    constexpr int candidates = 8;
+    double total = 0;
+    double square = 0;
+
+    for (int t = 0; t < trials; ++t) {
+        Reservoir r;
+        for (int i = 0; i < candidates; ++i) {
+            auto id = pick(rng);
+            r.update(id, p[id] * f.size(), u(rng));
+        }
+        double estimate = r.valid
+            ? f[r.id] * r.sum / (r.M * p[r.id])
+            : 0;
+        total += estimate;
+        square += estimate * estimate;
+    }
+    double mean = total / trials;
+    double variance = square / trials - mean*mean;
+    std::cout << mean << " expected 51\n";
+    std::cout << std::sqrt(variance/trials) << '\n';
+}
+#+end_src
+
+El valor esperado es 51, la suma de las seis contribuciones. La segunda salida aproxima el error estándar de la media. No esperamos obtener exactamente 51 en cada ejecución; esperamos que el promedio se acerque a ese número conforme aumenta el número de ensayos independientes.
+
+Un ejercicio interesante consiste en sustituir p por una constante. El algoritmo sigue siendo válido, pero selecciona candidatos sin tener en cuenta su importancia. Si sustituimos p por f, la selección se aproxima mucho mejor al objetivo. No obstante, incluso entonces el conjunto inicial de candidatos puede omitir la luz más importante. Un reservorio no inventa muestras que nunca recibió.
+
+En GPU utilizaremos normalmente float, no double. Conviene comprobar valores no finitos, desbordamientos del acumulador y el estado inválido. No se debe ocultar un error numérico mediante un clamp arbitrario y después afirmar que el estimador sigue siendo insesgado. El código de arriba presupone entradas finitas, no negativas y soporte suficiente.
+
+* Reutilizar información entre píxeles y fotogramas
+
+** Un reservorio representa más de una propuesta
+
+Supongamos que un píxel vecino ya ha construido un reservorio con M_b candidatos y peso final W_b. No tenemos acceso a su lista original, pero podemos reevaluar la muestra seleccionada en el punto actual x. Una regla básica de combinación utiliza el peso:
+
+\[
+ w_{b\rightarrow x}=p_x(Y_b)\,W_b\,M_b.
+\]
+
+El reservorio de destino incrementa su contador en M_b, no en uno. Si selecciona esa muestra, conserva su identidad y coordenadas sobre el emisor. Al final vuelve a normalizar usando la función objetivo del destino.
+
+La intuición es que W_b contiene la corrección asociada a la selección previa. Multiplicar por M_b recupera la escala del conjunto de propuestas representado. Multiplicar por el objetivo del destino permite decidir si la muestra es interesante en la nueva superficie.
+
+Hay una distinción importante: esta fórmula no convierte cualquier reutilización arbitraria en un estimador correcto. Si el dominio cambia, si una distribución de origen excluye muestras válidas en destino, o si se descartan propuestas según su contenido, la demostración sencilla deja de ser suficiente. En particular, la función objetivo del origen puede ser cero donde la del destino es positiva. Los esquemas de corrección de sesgo y de importancia múltiple del algoritmo completo existen precisamente para tratar estas situaciones.
+
+** Reutilización temporal
+
+Un motor con renderizado diferido suele disponer de profundidad, normales y vectores de movimiento. Para cada píxel actual buscamos la posición que correspondía a la misma superficie en el fotograma anterior. Si el vector de movimiento está expresado como posición anterior menos actual en píxeles, basta sumarlo a la coordenada actual. Otras convenciones requieren invertir el signo o convertir desde UV.
+
+Antes de leer el reservorio histórico comprobamos que la posición está dentro de pantalla, que la profundidad reproyectada es compatible y que la normal no ha cambiado demasiado. Para objetos dinámicos conviene disponer también de un identificador de instancia y de información sobre la transformación anterior. Comparar únicamente profundidades de cámara de dos fotogramas distintos puede rechazar superficies válidas cuando la cámara se mueve.
+
+La muestra almacenada debe seguir siendo interpretable. Un índice de luz reutilizado para otro objeto puede producir una iluminación completamente incorrecta. Una solución consiste en mantener identificadores estables con generaciones, o invalidar el historial cuando se reconstruye la tabla. Si almacenamos coordenadas baricéntricas de un triángulo emisivo, podemos reconstruir su posición actual incluso si se ha movido.
+
+El contador M histórico no debe crecer indefinidamente. En la práctica se limita para que las propuestas nuevas puedan competir con la historia y para controlar la correlación. Si reducimos M, debemos hacerlo de forma coherente con la representación de pesos; no basta con cambiar el denominador final. Limitar historia es una decisión del estimador y debe documentarse y medirse.
+
+** Reutilización espacial
+
+Un píxel situado sobre una pared suele compartir fuentes relevantes con los píxeles próximos de esa pared. En cambio, un píxel de una taza brillante junto a ella puede necesitar una distribución muy diferente. Por eso elegimos vecinos mediante un patrón de offsets y aplicamos pruebas de normal, profundidad y material.
+
+La distancia en pantalla no es distancia en el mundo. Dos píxeles contiguos pueden pertenecer a superficies separadas por cientos de metros. Una prueba geométrica reduce esa clase de errores, aunque no garantiza compatibilidad de visibilidad ni de BRDF.
+
+La reutilización espacial debe leer una versión estable de los reservorios. Si cada invocación escribe sobre el mismo buffer del que otras están leyendo, el resultado depende del orden de ejecución de los grupos de trabajo. Una barrera de grupo no sincroniza toda la cuadrícula. Utilizamos dos buffers y alternamos sus papeles entre pases.
+
+La correlación también importa. Si varios vecinos heredaron la misma muestra, sus reservorios no representan experimentos independientes. Contar sus M como si fueran observaciones nuevas exagera la información disponible. Esto puede producir patrones de ruido grandes y persistentes. La selección aleatoria de vecinos, los límites de historia y los esquemas de ponderación más completos ayudan a controlar el problema.
+
+* Arquitectura de una implementación Vulkan
+
+** Recursos y fases
+
+Una integración híbrida puede rasterizar primero la geometría opaca y producir un G-buffer. A partir de él se ejecutan tres pases de cómputo: generación inicial, reutilización temporal y reutilización espacial. Un último pase evalúa la contribución completa, incluida la visibilidad. El resultado HDR alimenta un denoiser y posteriormente el resto de la composición.
+
+Para consultar visibilidad desde un compute shader Vulkan puede utilizar VK_KHR_ray_query. Se necesita una estructura de aceleración válida y las características correspondientes habilitadas durante la creación del dispositivo. Las BLAS contienen geometría y la TLAS contiene instancias. Si hay objetos móviles, las estructuras deben actualizarse o reconstruirse antes de las consultas.
+
+Un posible layout de reservorio de 32 bytes es:
+
+#+begin_src cpp
+struct alignas(16) GpuReservoir {
+    uint32_t lightId;
+    uint32_t M;
+    float sampleU, sampleV;
+    float W;
+    uint32_t generation;
+    uint32_t flags;
+    uint32_t padding;
+};
+static_assert(sizeof(GpuReservoir) == 32);
+#+end_src
+
+En este formato W es el peso final, no la suma parcial. Durante un pase podemos mantener S en registros y escribir W al terminar. Las coordenadas de muestra deben tener una interpretación acordada entre CPU y GPU. Para un triángulo, dos coordenadas baricéntricas bastan; para una luz puntual pueden quedar sin uso.
+
+A 1920 por 1080, un buffer de 32 bytes por píxel ocupa 66.355.200 bytes, aproximadamente 63,3 MiB. Tres buffers ocupan unos 190 MiB. A 3840 por 2160, cada buffer ocupa unos 253 MiB. Es fácil que el coste de memoria y ancho de banda domine sobre la aritmética del reservorio.
+
+Una lectura y una escritura completas a 1080p representan aproximadamente 133 MB por fotograma. A 60 fotogramas por segundo son unos 8 GB/s de tráfico lógico. Si cada píxel lee cinco vecinos adicionales, se añaden casi 20 GB/s antes de considerar cachés. Estas cifras no son mediciones de DRAM: son una estimación de los bytes solicitados por el algoritmo. La reutilización en caché puede reducir el tráfico físico.
+
+** Consultar visibilidad
+
+El siguiente fragmento GLSL muestra una consulta para geometría opaca. El origen y el destino deben expresarse en el mismo espacio que la TLAS. Se presupone que la estructura está vinculada mediante un descriptor y que el shader tiene habilitada la extensión GL_EXT_ray_query.
+
+#+begin_src glsl
+#extension GL_EXT_ray_query : require
+layout(set=0,binding=0)
+uniform accelerationStructureEXT scene;
+
+bool visible(vec3 origin, vec3 target,
+             float epsilon) {
+    vec3 delta = target - origin;
+    float d = length(delta);
+    if (d <= 2.0 * epsilon) return true;
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq, scene,
+        gl_RayFlagsOpaqueEXT |
+        gl_RayFlagsTerminateOnFirstHitEXT,
+        0xff, origin, epsilon,
+        delta / d, d - epsilon);
+    while (rayQueryProceedEXT(rq)) {}
+    return rayQueryGetIntersectionTypeEXT(
+        rq, true) ==
+        gl_RayQueryCommittedIntersectionNoneEXT;
+}
+#+end_src
+
+El límite superior evita intersectar el propio emisor en el extremo del segmento. El desplazamiento del origen y epsilon requieren cuidado: una constante global demasiado grande permite fugas de luz en geometría pequeña, mientras que una demasiado pequeña produce autointersecciones. Un motor robusto utiliza un desplazamiento dependiente de la precisión de la posición y de la normal geométrica.
+
+La bandera opaca no es adecuada para follaje con alpha test o materiales transmisivos. Para esos casos hay que procesar candidatos no opacos y decidir si se confirma la intersección, o emplear otro modelo de visibilidad. Una consulta binaria tampoco representa correctamente la atenuación a través de medios participantes.
+
+** Sincronización entre pases
+
+Si la generación inicial escribe un storage buffer y el siguiente compute shader lo lee, existe una dependencia de memoria. En Vulkan con synchronization2 podemos expresarla mediante una barrera de memoria entre los dispatches:
+
+#+begin_src cpp
+VkMemoryBarrier2 barrier{
+    VK_STRUCTURE_TYPE_MEMORY_BARRIER_2
+};
+barrier.srcStageMask =
+    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+barrier.srcAccessMask =
+    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+barrier.dstStageMask =
+    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+barrier.dstAccessMask =
+    VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+
+VkDependencyInfo dep{
+    VK_STRUCTURE_TYPE_DEPENDENCY_INFO
+};
+dep.memoryBarrierCount = 1;
+dep.pMemoryBarriers = &barrier;
+vkCmdPipelineBarrier2(cmd, &dep);
+#+end_src
+
+El ejemplo supone una única cola y recursos separados de entrada y salida. Para reutilizar buffers que todavía están siendo leídos por otro pase o por otro fotograma hay que añadir las dependencias correspondientes. La construcción de la TLAS requiere asimismo sincronizar las escrituras de estructuras de aceleración con las lecturas posteriores de ray query. No basta con la barrera de storage buffer anterior.
+
+En Direct3D 12 la misma arquitectura puede implementarse con compute shaders, recursos UAV y RayQuery de DXR. Las transiciones y barreras UAV cumplen el papel de ordenar los accesos correspondientes. El algoritmo estadístico no depende de la API; sí dependen de ella la representación de recursos, la sincronización y la disponibilidad de consultas de rayos.
+
+* Qué medir y qué no confundir
+
+** Comparación con alternativas
+
+Una tabla alias permite seleccionar una luz en tiempo constante después de construir una distribución discreta. Es excelente como generador inicial de propuestas, pero una distribución global basada en potencia no sabe si una lámpara está cerca de una superficie concreta. ReSTIR puede utilizar esa tabla como entrada; no son alternativas excluyentes.
+
+Un árbol de luces puede aproximar mejor la importancia local mediante límites espaciales y de emisión. Tiene costes de construcción y actualización, especialmente con muchos emisores dinámicos. Puede combinarse igualmente con reservorios. El diseño óptimo depende de la distribución de luces y de la frecuencia con la que cambian.
+
+El clustered shading clásico asigna luces a regiones del frustum y evalúa las que afectan a cada región. Resulta muy eficiente cuando las luces tienen alcance limitado y su número local es pequeño. ReSTIR resulta más interesante cuando hay demasiadas contribuciones potenciales y necesitamos una estimación estocástica. Para una escena con cuatro luces no hay razón automática para adoptar toda esta infraestructura.
+
+** Experimento reproducible
+
+Construye una escena con un plano difuso, varios obstáculos y una cuadrícula de emisores de tamaños y potencias diferentes. Empieza con 64 emisores y aumenta hasta 4096. Mantén fija la exposición y genera una referencia con muchas muestras independientes por píxel.
+
+Compara cuatro configuraciones: muestreo uniforme con un rayo, selección inicial con ocho candidatos y un rayo, selección con historia temporal y finalmente reutilización espacial. Mide tiempos GPU por pase mediante timestamp queries y registra el número real de consultas de visibilidad. Calcula el error cuadrático medio en radiancia lineal antes del tone mapping. Una imagen visualmente agradable después del tone mapping puede ocultar errores de energía.
+
+Después mueve una luz brillante detrás de un obstáculo. Observa cuánto tarda el historial en adaptarse. Desactiva temporalmente las pruebas de reproyección para identificar sus artefactos. Visualiza el identificador de luz seleccionada, M y W como imágenes de diagnóstico. Una región con M enorme y una única luz seleccionada durante muchos fotogramas merece investigación, incluso si el color final parece estable.
+
+Finalmente compara el resultado con y sin denoiser. ReSTIR modifica la distribución de muestras; un denoiser reconstruye una señal ruidosa. Son etapas complementarias, pero medir únicamente la imagen filtrada dificulta identificar si el problema está en la selección, la visibilidad o el filtro.
+
+* Limitaciones y evolución
+
+El artículo original de 2020 distingue estimadores con diferentes compromisos entre sesgo y varianza. Sus resultados experimentales no constituyen una garantía universal de aceleración. El coste depende de la escena, el hardware, la distribución inicial, la coherencia de rayos y la implementación. Tampoco debe interpretarse la demostración del reservorio elemental de este capítulo como una prueba de corrección de todas las variantes espacio-temporales.
+
+Las superficies especulares estrechas, los emisores pequeños y muy intensos, las disoclusiones y las luces que cambian rápidamente son casos difíciles. Una función objetivo que ignore visibilidad puede seleccionar repetidamente una fuente brillante que está oculta. Incorporar información de visibilidad puede ayudar, pero aumenta el coste o introduce dependencia de información histórica potencialmente obsoleta.
+
+La familia evolucionó hacia ReSTIR GI y ReSTIR PT, que reutilizan información sobre iluminación indirecta y caminos de transporte. Allí aparecen dificultades adicionales: reconectar vértices, transformar densidades entre dominios y controlar correlaciones. El SDK RTXDI ofrece implementaciones de esta familia y ejemplos de integración. No conviene asumir que el pseudocódigo elemental presentado aquí reproduce todos sus mecanismos.
+
+* Conclusión
+
+La aportación fundamental de ReSTIR no es lanzar más rayos, sino decidir mejor cuáles lanzar. El reservorio ponderado transforma una lista potencialmente larga en un estado pequeño que conserva una muestra y una corrección estadística. La reutilización espacio-temporal intenta aprovechar ese estado allí donde todavía resulta informativo.
+
+El salto respecto a las técnicas históricas es conceptual: en lugar de procesar sistemáticamente cada luz, distribuimos un presupuesto limitado de consultas según la importancia estimada. La calidad depende tanto de las matemáticas de muestreo como de los detalles de ingeniería: identificadores estables, sincronización, precisión geométrica y ancho de banda.
+
+El primer paso para implementar la técnica no debería ser integrar un denoiser ni construir una escena enorme. Debería ser verificar el estimador discreto en CPU, trasladarlo a GPU sin historia, comprobar la energía contra una referencia y añadir cada forma de reutilización por separado. Así podremos distinguir una mejora de rendimiento real de un error que simplemente produce menos ruido.
+
+* Referencias originales
+
+- Bitterli, B.; Wyman, C.; Pharr, M.; Shirley, P.; Lefohn, A.; Jarosz, W. (2020). [[https://research.nvidia.com/publication/2020-07_spatiotemporal-reservoir-resampling-real-time-ray-tracing-dynamic-direct][Spatiotemporal reservoir resampling for real-time ray tracing with dynamic direct lighting]]. ACM Transactions on Graphics, SIGGRAPH 2020. Publicación revisada por pares; la página de los autores ofrece el manuscrito.
+- NVIDIA. [[https://github.com/NVIDIA-RTX/RTXDI][RTXDI SDK and Sample Applications]]. Implementación y ejemplos de integración de iluminación directa y extensiones posteriores. Código de referencia, no un sustituto de la derivación académica.
+
+Los ejemplos de código de este capítulo son originales y didácticos; no se han extraído del SDK. Las cifras de memoria son cálculos teóricos, no benchmarks ejecutados.
