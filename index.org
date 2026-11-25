@@ -4,6 +4,7 @@
 
 * 2026
 ** Noviembre
+- <2026-11-25 Wed> [[file:articulos/2026/11/2026-11-25-primeros-pixel-shaders.org][De los combinadores a los primeros pixel shaders: programar la iluminación en 2002]] :historia:retro:opengl:direct3d:shaders:
 - <2026-11-24 Tue> [[file:articulos/2026/11/2026-11-24-restir-reservoir-iluminacion-directa.org][ReSTIR: cómo elegir una luz entre millones mediante reservorios]] :moderno:gpu:raytracing:restir:montecarlo:
 - <2026-11-23 Mon> [[file:articulos/2026/11/2026-11-23-doom3-volumenes-sombra-stencil.org][DOOM 3 y los volúmenes de sombra: siluetas, stencil y Carmack's reverse]] :historia:retro:doom3:sombras:opengl:
 - <2026-11-22 Sun> [[file:articulos/2026/11/2026-11-22-temporal-upscaling-reproyeccion-historia.org][Temporal upscaling: reconstruir píxeles con historia, movimiento y jitter]] :moderno:gpu:temporal:upscaling:
