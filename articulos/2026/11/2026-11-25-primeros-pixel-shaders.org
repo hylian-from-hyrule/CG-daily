@@ -1,0 +1,353 @@
+#+TITLE: De los combinadores a los primeros pixel shaders: programar la iluminación en 2002
+#+DATE: 2026-11-25
+#+LANGUAGE: es
+#+FILETAGS: :historia:retro:opengl:direct3d:shaders:
+
+* Cuando un material era una configuración de hardware
+
+En 1998, programar un material para una aceleradora 3D no significaba escribir una función que recibiese la normal y devolviese un color. Significaba seleccionar una combinación de operaciones disponibles en el dispositivo. La textura podía modular el color interpolado de los vértices, mezclarse con una segunda textura o participar en una operación de transparencia. El programador describía el estado de una máquina, no un algoritmo arbitrario.
+
+Esta distinción explica buena parte de la evolución entre Direct3D 7 y Direct3D 9. En apenas unos años se pasó de configurar etapas de textura a escribir pequeños programas de ensamblador y, finalmente, a utilizar lenguajes de alto nivel. No fue una sustitución instantánea: durante años coexistieron rutas de renderizado para tarjetas con capacidades radicalmente distintas.
+
+El problema que estudiaremos es cómo implementar un material iluminado por píxel con un mapa de normales. Es una operación suficientemente sencilla para entender las restricciones de la época y suficientemente rica para mostrar por qué los primeros shaders cambiaron el diseño de los motores. Reconstruiremos primero el algoritmo matemático, después una implementación mediante combinadores y finalmente una versión en ensamblador ARB. Los ejemplos son reconstrucciones didácticas, no código extraído de un juego comercial.
+
+* El problema de interpolar la iluminación
+
+Consideremos un triángulo cuyos vértices tienen normales distintas. Una implementación clásica calcula la iluminación en cada vértice e interpola el color. Si los tres colores son oscuros, ningún punto interior puede ser más brillante que el mayor de ellos. Esto es problemático para un reflejo especular pequeño situado en el centro del triángulo.
+
+Sean las coordenadas baricéntricas corregidas en perspectiva \(b_0,b_1,b_2\). La interpolación de colores es
+
+\[
+C(P)=\sum_{i=0}^{2}b_i C_i.
+\]
+
+Los pesos son positivos dentro del triángulo y suman uno. Por tanto, el resultado pertenece a la envolvente convexa de los colores originales. Subdividir la geometría mejora la aproximación, pero aumenta el trabajo de transformación, el tamaño de las mallas y el número de primitivas.
+
+La alternativa consiste en interpolar los datos necesarios para evaluar la iluminación y ejecutar esa evaluación después de rasterizar. En lugar de transmitir únicamente el color, transmitimos una normal o una dirección de luz. El coste pasa a depender de los fragmentos cubiertos, no solamente de los vértices.
+
+Una textura de normales permite además introducir detalles que no existen en la geometría. Una pared plana puede representar pequeñas hendiduras sin añadir triángulos. No cambia la silueta ni la posición real de la superficie; modifica la dirección que utiliza el modelo de iluminación. Esta diferencia sigue siendo fundamental en motores modernos.
+
+** El producto escalar como operación gráfica
+
+Para una luz direccional y una superficie difusa ideal, podemos utilizar la aproximación
+
+\[
+C = A \odot E\,\max(0,N\cdot L),
+\]
+
+donde A es el color del material, E la intensidad y color de la luz, N la normal unitaria y L la dirección unitaria hacia la luz. El símbolo representa multiplicación componente a componente. Omitimos aquí el factor constante de la BRDF lambertiana, que puede incorporarse en E para este experimento.
+
+El producto escalar mide el coseno del ángulo entre dos vectores unitarios. Si la luz incide perpendicularmente, vale uno; si es tangente, vale cero. Un resultado negativo indica que la luz llega desde detrás de la superficie.
+
+Por ejemplo, para N=(0,0,1) y L=(0.6,0,0.8), el factor es 0.8. Si una pequeña irregularidad modifica N a (0.6,0,0.8), el factor sube a uno. Dos texels de una misma pared adquieren intensidades distintas aunque pertenezcan al mismo triángulo.
+
+* Cómo almacenar una dirección en una textura
+
+Una textura RGB de ocho bits por canal almacena valores normalizados entre cero y uno. Una normal contiene componentes negativas. Para hacer compatible ambos dominios utilizamos una transformación afín:
+
+\[
+t=\frac{N+1}{2},\qquad N=2t-1.
+\]
+
+La normal (0,0,1) se codifica aproximadamente como (128,128,255). Una normal inclinada hacia la derecha produce un rojo más intenso. El azul suele dominar porque la mayoría de normales apuntan hacia fuera de la superficie.
+
+La cuantización introduce un error máximo de aproximadamente 1/255 por componente después de decodificar, suponiendo redondeo al entero más cercano. El filtrado añade otro problema: la media de dos vectores unitarios no es necesariamente un vector unitario.
+
+Si interpolamos (1,0,0) y (0,0,1) con pesos iguales, obtenemos (0.5,0,0.5), cuya longitud es aproximadamente 0.707. Normalizarla recupera la dirección, pero requiere calcular una raíz cuadrada inversa. Una tarjeta antigua podía no ofrecer una forma directa de realizar esa operación en su etapa de fragmentos.
+
+Es importante no activar una transformación sRGB sobre el mapa de normales: sus canales representan datos geométricos, no intensidades de color codificadas para visualización. En un experimento moderno utilizaremos un formato lineal para esta textura.
+
+** El espacio tangente
+
+Una textura de normales debe poder aplicarse a superficies orientadas de formas diferentes. Por ello se almacena habitualmente en un sistema de coordenadas local compuesto por tangente T, bitangente B y normal geométrica N_g.
+
+Para construirlo a partir de un triángulo, definimos dos aristas e1 y e2 y sus diferencias de coordenadas UV. Queremos encontrar T y B tales que
+
+\[
+e_1=T\Delta u_1+B\Delta v_1,
+\qquad
+e_2=T\Delta u_2+B\Delta v_2.
+\]
+
+Al resolver el sistema lineal obtenemos
+
+\[
+D=\Delta u_1\Delta v_2-\Delta u_2\Delta v_1,
+\]
+\[
+T=\frac{e_1\Delta v_2-e_2\Delta v_1}{D},
+\qquad
+B=\frac{e_2\Delta u_1-e_1\Delta u_2}{D}.
+\]
+
+Si D es cero, las UV son degeneradas y no definen una base válida. En una malla real se acumulan contribuciones de los triángulos y se ortogonaliza la tangente respecto a la normal. También debe conservarse la orientación de las islas UV reflejadas. Un motor de producción necesita que el generador de tangentes coincida con el utilizado al crear el mapa de normales.
+
+El siguiente fragmento C++ utiliza GLM para mostrar el cálculo de una base por triángulo. No pretende sustituir un generador de tangentes de producción.
+
+#+begin_src cpp
+struct Basis {
+    glm::vec3 t, b, n;
+};
+
+std::optional<Basis> makeBasis(
+    glm::vec3 e1, glm::vec3 e2,
+    glm::vec2 uv1, glm::vec2 uv2,
+    glm::vec3 n)
+{
+    float d = uv1.x*uv2.y - uv2.x*uv1.y;
+    if (std::abs(d) < 1e-8f)
+        return std::nullopt;
+    auto t = (e1*uv2.y-e2*uv1.y)/d;
+    auto b = (e2*uv1.x-e1*uv2.x)/d;
+    n = glm::normalize(n);
+    t -= n*glm::dot(n,t);
+    if (glm::dot(t,t) < 1e-12f)
+        return std::nullopt;
+    t = glm::normalize(t);
+    float sign = glm::dot(glm::cross(n,t),b)
+                 < 0.f ? -1.f : 1.f;
+    return Basis{t,sign*glm::cross(n,t),n};
+}
+#+end_src
+
+Para una base ortonormal, transformar la luz del espacio del objeto al espacio tangente consiste simplemente en calcular tres productos escalares. Esto permite hacerlo por vértice, una decisión especialmente atractiva cuando el hardware de fragmentos es limitado. Para una luz direccional y una pared plana, la dirección resultante es constante. Para una superficie curva o una luz puntual, la interpolación de direcciones necesita más cuidado.
+
+* Los combinadores de textura
+
+En OpenGL clásico, cada unidad de textura podía combinar su muestra con un color procedente de una etapa anterior. Las extensiones de combinación añadieron operaciones que permitían construir expresiones más interesantes sin un lenguaje de programación general.
+
+La operación DOT3 es particularmente importante. Sean a y b dos colores RGB codificados entre cero y uno. El producto de sus vectores decodificados es
+
+\[
+(2a-1)\cdot(2b-1)
+=4\sum_{k=1}^{3}(a_k-0.5)(b_k-0.5).
+\]
+
+Esta identidad explica por qué una operación de combinación de colores podía implementar iluminación geométrica. El hardware no necesitaba conocer el concepto de normal: únicamente debía realizar tres multiplicaciones, sumarlas y limitar el resultado al intervalo representable.
+
+Una configuración de dos unidades puede calcular primero el producto escalar entre la textura de normales y la dirección de luz codificada en el color primario. La segunda unidad multiplica el resultado por el albedo. Para simplificar, suponemos una luz blanca de intensidad uno, sin atenuación ni especular.
+
+#+begin_src cpp
+// Contexto OpenGL compatible con multitextura
+// y texture environment DOT3.
+glActiveTexture(GL_TEXTURE0);
+glEnable(GL_TEXTURE_2D);
+glBindTexture(GL_TEXTURE_2D, normalMap);
+glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE,
+          GL_COMBINE);
+glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB,
+          GL_DOT3_RGB);
+glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE0_RGB,
+          GL_TEXTURE);
+glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE1_RGB,
+          GL_PRIMARY_COLOR);
+glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_RGB,
+          GL_SRC_COLOR);
+glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND1_RGB,
+          GL_SRC_COLOR);
+
+glActiveTexture(GL_TEXTURE1);
+glEnable(GL_TEXTURE_2D);
+glBindTexture(GL_TEXTURE_2D, albedo);
+glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE,
+          GL_COMBINE);
+glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB,
+          GL_MODULATE);
+glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE0_RGB,
+          GL_PREVIOUS);
+glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE1_RGB,
+          GL_TEXTURE);
+glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_RGB,
+          GL_SRC_COLOR);
+glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND1_RGB,
+          GL_SRC_COLOR);
+#+end_src
+
+La aplicación debe proporcionar las UV para ambas unidades y el color primario codificado a partir de la luz. En este ejemplo se desactiva la iluminación fija de vértices para que no altere dicho color. También se supone que el material es opaco y se controla el canal alfa por separado si resulta necesario.
+
+El orden importa: intercambiar las dos unidades no conserva el algoritmo. La segunda etapa consume el resultado de la primera. Si queremos añadir otra textura, una máscara especular o una segunda luz, necesitamos más etapas o más pases. Esta es la diferencia entre disponer de una operación y disponer de un lenguaje capaz de componer operaciones libremente.
+
+** Una textura para normalizar vectores
+
+Una solución histórica al problema de la longitud consistía en utilizar un cubemap de normalización. Para cada dirección del cubo se almacena el vector unitario correspondiente, codificado como color. Al consultar el cubemap con un vector no nulo, la selección de cara y las coordenadas dependen de la dirección, no de su magnitud.
+
+Podemos construir cada texel calculando una dirección a partir de las coordenadas de la cara y normalizándola en CPU. El coste en GPU es una consulta de textura en lugar de una raíz cuadrada inversa y varias multiplicaciones.
+
+Un cubemap de seis caras de 64 por 64 texels RGB8 ocupa 73 728 bytes de datos sin mipmaps ni padding. No es una cantidad enorme, pero consume una unidad de textura y ancho de banda. El filtrado y la cuantización hacen que la normalización sea aproximada; cerca de las aristas del cubo también pueden aparecer discontinuidades según el modo de filtrado.
+
+Esta técnica ilustra una estrategia habitual de la época: trasladar una operación matemática a una tabla precalculada. La tabla no es necesariamente más rápida en una GPU actual, donde la aritmética puede ser barata y la latencia de memoria relativamente elevada.
+
+* Del estado fijo al ensamblador de fragmentos
+
+La especificación ARB_fragment_program, aprobada en 2002, expuso una máquina abstracta con registros temporales, atributos interpolados, parámetros e instrucciones de aritmética y textura. No debe confundirse con el conjunto de instrucciones físico de una GPU. El controlador traducía el programa a las capacidades de cada implementación.
+
+El siguiente programa expresa el mismo material que antes, pero ahora podemos normalizar la normal y la luz explícitamente. Usamos el atributo de color primario para transportar la luz codificada y las coordenadas de textura cero y uno para las dos muestras.
+
+#+begin_src text
+!!ARBfp1.0
+TEMP n, l, a, k;
+TEX n, fragment.texcoord[0], texture[0], 2D;
+MAD n.xyz, n, 2.0, -1.0;
+MAD l.xyz, fragment.color.primary, 2.0, -1.0;
+DP3 k.x, n, n;
+MAX k.x, k.x, 0.000001;
+RSQ k.x, k.x;
+MUL n.xyz, n, k.x;
+DP3 k.x, l, l;
+MAX k.x, k.x, 0.000001;
+RSQ k.x, k.x;
+MUL l.xyz, l, k.x;
+DP3_SAT k.x, n, l;
+TEX a, fragment.texcoord[1], texture[1], 2D;
+MUL result.color.xyz, a, k.x;
+MOV result.color.w, a.w;
+END
+#+end_src
+
+La instrucción MAD combina multiplicación y suma; DP3 calcula un producto escalar de tres componentes; RSQ calcula una raíz cuadrada inversa. El sufijo SAT limita el resultado al intervalo de cero a uno. Las máscaras xyz y w permiten controlar por separado RGB y alfa.
+
+El pequeño valor utilizado antes de RSQ evita dividir por cero. Un vector exactamente nulo sigue sin tener dirección válida, pero esta protección evita que la operación genere un infinito. En una aplicación real conviene definir una normal de reserva.
+
+El programa es lineal: no contiene bucles ni saltos dinámicos. El ensamblador ARB no ofrece las posibilidades de control de flujo de un shader moderno. Aun así, la diferencia respecto a los combinadores es enorme: podemos reutilizar registros y organizar expresiones sin que cada operación corresponda necesariamente a una etapa de textura.
+
+** Cargar el programa desde C++
+
+En un contexto compatible y con las funciones de extensión cargadas, la aplicación crea un objeto de programa y entrega su texto al controlador. El siguiente código presupone que se ha comprobado la disponibilidad de ARB_fragment_program y que las funciones se han resuelto mediante el cargador de OpenGL.
+
+#+begin_src cpp
+GLuint loadFragmentProgram(const std::string& src)
+{
+    GLuint id = 0;
+    glGenProgramsARB(1, &id);
+    glBindProgramARB(GL_FRAGMENT_PROGRAM_ARB,id);
+    glProgramStringARB(
+        GL_FRAGMENT_PROGRAM_ARB,
+        GL_PROGRAM_FORMAT_ASCII_ARB,
+        static_cast<GLsizei>(src.size()),
+        src.data());
+
+    GLint pos = -1;
+    glGetIntegerv(GL_PROGRAM_ERROR_POSITION_ARB,
+                  &pos);
+    if (pos != -1) {
+        auto msg = glGetString(
+            GL_PROGRAM_ERROR_STRING_ARB);
+        std::string error = msg
+            ? reinterpret_cast<const char*>(msg)
+            : "Error de programa";
+        glDeleteProgramsARB(1,&id);
+        throw std::runtime_error(error);
+    }
+    return id;
+}
+#+end_src
+
+Al dibujar, se habilita GL_FRAGMENT_PROGRAM_ARB y se vincula el objeto. Las texturas deben estar vinculadas a las unidades referenciadas en el código. La aplicación debe comprobar también los errores generales de OpenGL y restaurar el estado cuando cambie de ruta de renderizado.
+
+La especificación distingue entre los límites abstractos y los recursos nativos de la implementación. Consultar GL_PROGRAM_UNDER_NATIVE_LIMITS_ARB mediante glGetProgramivARB ayuda a identificar programas que exceden los recursos nativos. No es una medida directa de rendimiento ni garantiza que dos tarjetas ejecuten el mismo programa con idéntico coste.
+
+* Añadir un reflejo especular
+
+La iluminación difusa no basta para representar una superficie pulida. Una aproximación clásica es el modelo de Blinn-Phong, que utiliza el vector medio entre la dirección de luz L y la dirección hacia el observador V:
+
+\[
+H=\frac{L+V}{\|L+V\|},
+\qquad
+S=\max(0,N\cdot H)^p.
+\]
+
+El exponente p controla la concentración del reflejo. Con un producto escalar de 0.9, un exponente de 8 produce aproximadamente 0.430; con 32 obtenemos 0.0343. Un exponente elevado hace que pequeñas diferencias angulares produzcan grandes cambios de intensidad.
+
+Si el exponente es una potencia de dos, podemos calcularlo mediante multiplicaciones sucesivas. Para elevar x a 16 basta calcular x al cuadrado, al cuarto, a la octava y finalmente a la decimosexta potencia. Son cuatro multiplicaciones, no quince.
+
+#+begin_src text
+# k.x contiene max(0, dot(N,H)).
+MUL k.x, k.x, k.x;
+MUL k.x, k.x, k.x;
+MUL k.x, k.x, k.x;
+MUL k.x, k.x, k.x;
+#+end_src
+
+En un hardware con una instrucción de potencia adecuada podemos expresar el cálculo directamente, pero no debemos asumir que una instrucción de ensamblador abstracta equivale a un único ciclo físico. Una implementación puede descomponerla en varias operaciones.
+
+El reflejo debe suprimirse cuando la luz está detrás de la superficie. También es necesario gestionar el caso en que L y V son opuestos y el vector medio no está definido. Estos detalles, aparentemente menores, determinan si un material funciona únicamente en una demostración o también en una escena con cámaras y luces arbitrarias.
+
+* Direct3D y las versiones de pixel shader
+
+Direct3D siguió una evolución paralela. Los perfiles ps_1_1, ps_1_2, ps_1_3 y ps_1_4 representaban capacidades concretas de las primeras generaciones programables. El programador no podía asumir que un shader escrito para un perfil posterior funcionaría en una tarjeta anterior.
+
+La documentación de Microsoft distingue instrucciones de direccionamiento de texturas y operaciones aritméticas. El perfil ps_1_4 introduce una separación en fases mediante la instrucción phase. Estas restricciones reflejan una organización del hardware muy diferente de la que hoy asociamos a un shader general.
+
+Con los perfiles 2.0 y posteriores se amplió considerablemente la libertad para combinar aritmética y consultas de textura. Sin embargo, incluso en esta etapa seguían existiendo presupuestos de instrucciones, registros y dependencias. Un motor necesitaba seleccionar variantes según las capacidades del dispositivo.
+
+El equivalente conceptual del material anterior en un lenguaje de alto nivel moderno es:
+
+#+begin_src c
+float3 n = normalize(normalTex.Sample(samp, uv)
+                     .xyz * 2.0 - 1.0);
+float3 l = normalize(lightTS);
+float3 a = albedoTex.Sample(samp, uv).rgb;
+float3 color = a * saturate(dot(n,l));
+#+end_src
+
+Este fragmento usa sintaxis HLSL moderna y no es directamente compilable como ps_1_1. La comparación sirve para apreciar cuánto trabajo de asignación de registros y selección de instrucciones delegamos hoy al compilador.
+
+* El precio de los pases adicionales
+
+Supongamos una escena de 1024 por 768 píxeles y un material que requiere tres pases de pantalla completa. Cada pase lee dos texturas y escribe un color de cuatro bytes. Si cada lectura efectiva fuese de cuatro bytes y no existiesen cachés, compresión ni lecturas de destino, el tráfico sería
+
+\[
+1024\cdot768\cdot3\cdot12
+=28\,311\,552\ \mathrm{bytes}.
+\]
+
+A 60 imágenes por segundo son aproximadamente 1.70 GB/s. Es un modelo ilustrativo, no una medición: el filtrado puede consultar varios texels, las cachés reducen el tráfico y el blending puede exigir leer el destino. También faltan profundidad, geometría y otros recursos.
+
+Una implementación multipase suele dibujar la misma geometría varias veces. El primer pase puede establecer profundidad y color; los posteriores usan una prueba de profundidad compatible y blending aditivo o multiplicativo según la expresión. Si el primer resultado se limita al rango de un framebuffer de ocho bits, la información perdida no puede recuperarse en el siguiente pase.
+
+Consideremos dos contribuciones de luz de intensidad 0.8. Su suma es 1.6. Si se almacena en un destino normalizado de ocho bits, se limita a uno. Multiplicar después por 0.5 produce 0.5 en lugar de 0.8. Cambiar el orden de las operaciones puede cambiar la imagen aunque las expresiones parezcan algebraicamente equivalentes. Los formatos de mayor rango dinámico ayudan, pero su disponibilidad y capacidad de blending dependían del dispositivo.
+
+* Laboratorio: reconstruir las tres generaciones
+
+Una práctica útil consiste en crear una aplicación con un cuadrado texturizado y una luz direccional que gira alrededor de él. Utiliza un mapa de normales generado proceduralmente para que las direcciones sean conocidas. Por ejemplo, una superficie de altura h(u,v)=a sin(2 pi u) permite calcular una normal proporcional a (-dh/du,0,1).
+
+Implementa tres rutas: iluminación por vértice, combinación DOT3 y programa de fragmentos. Para la primera utiliza únicamente las normales geométricas; para las otras dos utiliza la textura. Compara después la ruta DOT3 con el programa de fragmentos usando exactamente las mismas entradas. La diferencia revela el efecto de la normalización y la precisión.
+
+Para generar una textura de prueba en CPU puedes utilizar el siguiente código, suponiendo GLM y una imagen RGB8 de tamaño w por h.
+
+#+begin_src cpp
+for (int y=0; y<h; ++y) {
+    for (int x=0; x<w; ++x) {
+        float u = (x+0.5f)/w;
+        float slope = amplitude*6.2831853f
+                      *std::cos(6.2831853f*u);
+        auto n = glm::normalize(
+            glm::vec3(-slope,0,1));
+        for (int c=0;c<3;++c)
+            pixels[3*(y*w+x)+c] =
+                static_cast<unsigned char>(
+                    std::lround(
+                        (n[c]*0.5f+0.5f)*255));
+    }
+}
+#+end_src
+
+Prueba primero filtrado nearest y después bilinear. Reduce progresivamente la resolución de la textura y observa cómo cambia el brillo. Añade una segunda luz y compara una implementación multipase con una que acumule ambas contribuciones antes de escribir el resultado. Finalmente utiliza un framebuffer flotante en una implementación moderna para aislar los errores de saturación.
+
+Para medir rendimiento, evita confundir el tiempo de envío de comandos de CPU con el tiempo de ejecución de GPU. En hardware moderno puedes utilizar consultas temporales de OpenGL cuando estén disponibles. Una emulación mediante GLSL permite estudiar las imágenes y las restricciones algorítmicas, pero no reproduce fielmente los tiempos de una GeForce de 2002. Para estudiar rendimiento histórico se necesita hardware y controladores representativos.
+
+* Qué queda de esta arquitectura
+
+Las GPU modernas siguen utilizando productos escalares, interpolación, unidades de textura y registros. La ruptura no consiste en que estas operaciones desapareciesen, sino en que dejaron de estar ligadas a una secuencia rígida de etapas configurables.
+
+Los shaders actuales permiten expresar algoritmos mucho más complejos, pero siguen teniendo restricciones de ocupación, registros, latencia de memoria y divergencia. El presupuesto explícito de instrucciones de principios de siglo ha sido sustituido por un conjunto de costes menos visibles. Comprender los combinadores ayuda a reconocer cuándo una expresión aparentemente pequeña requiere múltiples accesos a memoria o cuándo una representación de datos permite simplificar el cálculo.
+
+La lección histórica es que la programabilidad no apareció de golpe. Surgió de ampliar gradualmente las operaciones disponibles, primero sobre colores, después sobre direcciones de textura y finalmente sobre registros generales. Un mapa de normales es un excelente ejemplo de esta transición: el mismo problema matemático puede resolverse mediante estado fijo, tablas precalculadas, ensamblador o un shader de alto nivel.
+
+* Referencias originales
+
+- [[https://developer.download.nvidia.com/opengl/specs/nvOpenGLspecs.pdf][NVIDIA, OpenGL Extension Specifications]]. Compilación de especificaciones originales de extensiones, útil para estudiar combinadores y programas de fragmentos.
+- [[https://skia.googlesource.com/external/github.com/KhronosGroup/OpenGL-Registry/%2B/refs/heads/310-issue/extensions/ARB/ARB_fragment_program.txt][OpenGL ARB, ARB_fragment_program]]. Especificación aprobada en septiembre de 2002, copia del registro Khronos.
+- [[https://learn.microsoft.com/hi-in/windows/win32/direct3dhlsl/dx9-graphics-reference-asm-ps-instructions-ps-1-x][Microsoft, instrucciones de pixel shader 1.x]]. Referencia oficial de los perfiles de ensamblador.
+- [[https://www.opengl.org/archives/about/arb/meeting_notes/notes/meeting_note_2000-12-05.html][OpenGL ARB, actas de diciembre de 2000]]. Contexto contemporáneo de la estandarización de combinadores.
+- [[https://wikis.khronos.org/opengl/History_of_Programmability][Khronos, History of Programmability]]. Contexto retrospectivo complementario.
