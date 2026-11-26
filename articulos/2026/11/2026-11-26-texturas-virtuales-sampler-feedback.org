@@ -1,0 +1,370 @@
+#+TITLE: Texturas virtuales y sampler feedback: gestionar la memoria por páginas
+#+DATE: <2026-11-26 Thu>
+#+LANGUAGE: es
+#+FILETAGS: :moderno:gpu:texturas:vulkan:direct3d12:
+
+* Una textura que no cabe en la tarjeta gráfica
+
+Imaginemos un simulador de vuelo que permite acercarse desde varios kilómetros de altura hasta una pista de aterrizaje. Desde arriba necesitamos una representación de toda la región; desde el suelo, detalles de unos centímetros. Si asignamos a cada superficie la máxima resolución posible, la memoria necesaria crece con el cuadrado de la resolución. Pero la pantalla no crece al mismo ritmo. Una pantalla 4K tiene poco más de ocho millones de píxeles, mientras que una sola textura de 16384 por 16384 contiene más de 268 millones de texels.
+
+Durante los noventa, el problema se resolvía repitiendo pequeñas texturas, combinándolas con mapas de iluminación y cargando materiales por zonas. El mipmapping permitía reducir el aliasing y mejorar la localidad de acceso, pero no resolvía por sí mismo la residencia en memoria. Una textura podía contener niveles que jamás se utilizaban durante una escena concreta.
+
+La idea de las texturas virtuales consiste en separar la imagen lógica que ve el artista de las regiones físicas que realmente existen en la memoria de la GPU. La analogía con la memoria virtual de un sistema operativo es útil, aunque tiene un límite importante: en un motor gráfico no queremos suspender miles de fragmentos mientras esperamos a que el almacenamiento entregue una página. Preferimos mostrar temporalmente una versión menos detallada y solicitar la página para un fotograma posterior.
+
+La técnica tiene antecedentes en los sistemas de texturas de gran tamaño de los años 2000. Direct3D 11.2 introdujo recursos por teselas, Vulkan incorporó recursos dispersos desde su primera generación y Direct3D 12 añadió posteriormente mecanismos de sampler feedback que permiten conocer mejor qué regiones solicita el filtrado de texturas. El interés moderno no reside en haber inventado la paginación, sino en integrarla en motores asíncronos con grandes cantidades de materiales, almacenamiento rápido y presupuestos de memoria estrictos.
+
+* Cuánto cuesta una imagen
+
+Para una textura cuadrada de lado N, con b bytes por texel y todos sus niveles mip, la memoria ideal es
+
+\[
+ B=bN^2\sum_{i=0}^{\log_2 N}4^{-i}
+ \approx \frac{4}{3}bN^2.
+\]
+
+La serie aparece porque cada nivel tiene la mitad de anchura y altura que el anterior. El segundo nivel ocupa una cuarta parte, el tercero una dieciseisava parte y así sucesivamente. Los niveles pequeños añaden relativamente poco almacenamiento, aunque son fundamentales para el filtrado.
+
+Con N=16384 y RGBA8, el nivel principal ocupa exactamente 1 GiB y la cadena completa aproximadamente 1,333 GiB. En BC7, que almacena bloques de cuatro por cuatro texels en 16 bytes, la aproximación baja a 341,3 MiB. Los niveles diminutos requieren al menos un bloque, por lo que la cifra exacta difiere ligeramente.
+
+Si un terreno necesita albedo, normales y propiedades físicas, tres cadenas de tamaño equivalente superarían un GiB incluso comprimidas. Y esto es solo un terreno. La memoria disponible debe compartirse con geometría, buffers de profundidad, sombras, estructuras de aceleración y recursos temporales.
+
+Dividamos ahora la imagen en páginas de 128 por 128 texels. El nivel cero tiene 128 por 128 páginas, es decir, 16384. Hasta el nivel siete, que contiene una única página, hay 21845 páginas. Los niveles inferiores pueden almacenarse juntos en una cola de mips.
+
+Una tabla lógica con una entrada de cuatro bytes por página ocupa aproximadamente 85,3 KiB. Es una cantidad pequeña comparada con la imagen. Si mantenemos únicamente 1024 páginas BC7, sin bordes adicionales, consumimos 16 MiB de datos. Esto no significa que podamos mostrar cualquier vista con calidad perfecta: significa que hemos sustituido una asignación fija por una caché cuyo éxito depende del conjunto de trabajo visible.
+
+* La traducción de direcciones
+
+Supongamos coordenadas UV normalizadas y un nivel mip m. Su resolución es N_m=max(1,N/2^m). Para simplificar, consideraremos niveles con dimensiones múltiplos de P, el tamaño de página.
+
+La posición continua en texels es
+
+\[
+ t=(uN_m,vN_m).
+\]
+
+La dirección lógica de página y la posición local son
+
+\[
+ p=\lfloor t/P\rfloor,\qquad r=t-Pp.
+\]
+
+La tabla de páginas traduce la tripleta (m,p_x,p_y) a una posición física. Si la página no existe, buscamos el nivel siguiente. Como la resolución se reduce a la mitad, el padre de una página es (m+1,p_x/2,p_y/2), usando división entera.
+
+Conviene recalcular las coordenadas locales desde las UV originales cuando cambiamos de nivel. No basta con conservar el desplazamiento local y dividirlo por dos: una página hija situada a la derecha de su padre debe incorporar también el desplazamiento correspondiente a esa mitad.
+
+En un atlas físico, cada página ocupa una celda. Si añadimos un borde de g texels, la dimensión de la celda es S=P+2g. Para una celda de coordenadas c y un atlas de dimensiones A, la coordenada normalizada resulta
+
+\[
+ a=\frac{Sc+g+r}{A}.
+\]
+
+Esta expresión supone que r se mide desde el límite de los texels, no desde sus centros. Es importante mantener esa convención tanto al preparar las páginas como al muestrearlas: introducir medio texel arbitrariamente produce desplazamientos y discontinuidades.
+
+** Una tabla sencilla en C++
+
+#+begin_src cpp
+#include <cstdint>
+#include <vector>
+#include <algorithm>
+
+struct Page {
+    uint32_t mip, x, y;
+};
+
+struct Entry {
+    uint32_t slot;
+    bool resident;
+};
+
+struct Level {
+    uint32_t width, height;
+    std::vector<Entry> entries;
+};
+
+struct VirtualTexture {
+    std::vector<Level> levels;
+
+    Entry lookup(Page p) const {
+        const auto& l = levels.at(p.mip);
+        return l.entries.at(p.y*l.width+p.x);
+    }
+
+    Page fallback(Page p) const {
+        while (!lookup(p).resident) {
+            if (p.mip+1 >= levels.size())
+                throw "Missing permanent root";
+            p = {p.mip+1, p.x/2, p.y/2};
+        }
+        return p;
+    }
+};
+#+end_src
+
+Este modelo presupone dimensiones potencia de dos y una raíz permanentemente residente. En una implementación general, la tabla debe manejar niveles rectangulares, páginas parciales y varias texturas. El índice de la textura forma parte de la clave; de lo contrario dos materiales podrían solicitar accidentalmente la misma página.
+
+La estructura de CPU no tiene por qué coincidir con la representación de GPU. Una tabla de enteros R32_UINT puede empaquetar el índice de celda y un bit de validez. Otra posibilidad es almacenar directamente el ancestro residente en cada entrada, evitando un bucle en el shader a cambio de actualizar más entradas al modificar la residencia.
+
+* Elegir el nivel mip correcto
+
+La textura virtual no elimina la necesidad de calcular el área de textura cubierta por un píxel. En rasterización, las derivadas de las coordenadas interpoladas permiten aproximar esa huella.
+
+Si la textura mide N_x por N_y, definimos dos vectores en unidades de texel:
+
+\[
+ d_x=(N_x\partial_x u,N_y\partial_x v),
+ \quad d_y=(N_x\partial_y u,N_y\partial_y v).
+\]
+
+Una aproximación isotrópica al nivel deseado es
+
+\[
+ \lambda=\log_2\max(\|d_x\|,\|d_y\|).
+\]
+
+Si el mayor vector mide ocho texels por píxel, lambda vale tres. Un mip de nivel tres reduce esa huella a aproximadamente un texel por píxel. El cálculo no representa perfectamente la huella elíptica de un filtro anisotrópico, pero sirve como punto de partida.
+
+El nivel solicitado debe calcularse antes de buscar el ancestro residente. Si calculamos el feedback a partir del nivel que finalmente mostramos, el sistema podría quedar atrapado en una versión borrosa: nunca pediría los niveles de detalle que faltan.
+
+En un atlas, las derivadas de las coordenadas físicas tampoco deben calcularse directamente después de traducir las páginas. Dos fragmentos contiguos pueden acabar en celdas muy alejadas, y una derivada basada en esa diferencia interpretaría erróneamente que la textura cambia a una velocidad enorme. Hay que conservar las derivadas virtuales y transformarlas analíticamente, o utilizar muestreo explícito de nivel.
+
+* El problema de los bordes
+
+Un filtro bilineal mezcla cuatro texels. Si el punto cae junto al límite de una página, alguno de esos texels pertenece a la página vecina. En una textura ordinaria el hardware resuelve este acceso automáticamente. En un atlas, el vecino físico puede ser una región completamente distinta.
+
+La solución clásica es añadir un borde a cada página. Durante la preparación de datos copiamos texels de las páginas vecinas del mismo mip. No debemos limitar el borde al último texel de la página, porque eso elimina la continuidad real del contenido.
+
+Para P=128 y g=4, la celda ocupa 136 por 136 texels. La sobrecarga relativa es
+
+\[
+ \frac{136^2}{128^2}-1=0.12890625.
+\]
+
+Es decir, aproximadamente un 12,9 por ciento. En BC7 una celda ocupa 34 por 34 bloques de 16 bytes, o 18496 bytes. Un atlas de 1024 celdas necesita aproximadamente 18,06 MiB. Elegir tamaños compatibles con los bloques de compresión simplifica las copias.
+
+Un borde de cuatro texels no garantiza un filtrado anisotrópico arbitrario. Cuanto más alargada sea la huella, más probable es que alcance regiones que no están representadas por el borde. Podemos reducir el grado de anisotropía, aumentar el borde o realizar varias muestras virtuales explícitas. Cada solución intercambia memoria, calidad y trabajo del shader.
+
+El filtrado trilineal introduce otro problema: los dos niveles mip que participan pueden tener grados de residencia distintos. Si uno recurre a un ancestro mucho más grueso, mezclarlo con un nivel fino puede producir transiciones visibles. Un sistema sencillo puede utilizar un nivel común conservador; otro puede mezclar resultados independientes y suavizar la aparición de páginas durante varios fotogramas.
+
+** Un shader de referencia
+
+El siguiente GLSL muestra el caso isotrópico con una tabla de páginas por nivel, un atlas sin cadena mip propia y una raíz garantizada. Se presupone una textura cuadrada potencia de dos, dimensiones divisibles por P hasta el nivel raíz y UV en el intervalo semiabierto de cero a uno.
+
+#+begin_src glsl
+layout(set=0,binding=0) uniform usampler2D pageTable;
+layout(set=0,binding=1) uniform sampler2D atlas;
+
+const int P = 128;
+const int G = 4;
+const int S = P + 2*G;
+const int N = 16384;
+const int ROOT = 7;
+const uint VALID = 0x80000000u;
+
+vec4 sampleVirtual(vec2 uv) {
+    vec2 dx = dFdx(uv) * float(N);
+    vec2 dy = dFdy(uv) * float(N);
+    float lod = log2(max(1.0,
+                    max(length(dx),length(dy))));
+    int wanted = clamp(int(floor(lod)),0,ROOT);
+    uv = clamp(uv,vec2(0),vec2(0.99999994));
+
+    for (int m=wanted; m<=ROOT; ++m) {
+        float dim = float(N >> m);
+        vec2 t = uv * dim;
+        ivec2 p = ivec2(floor(t/float(P)));
+        uint e = texelFetch(pageTable,p,m).r;
+        if ((e & VALID)==0u) continue;
+
+        uint slot = e & ~VALID;
+        ivec2 size = textureSize(atlas,0);
+        uint cols = uint(size.x/S);
+        ivec2 cell = ivec2(slot%cols,slot/cols);
+        vec2 local = t-vec2(p*P);
+        vec2 a = (vec2(cell*S+ivec2(G))+local)
+                 / vec2(size);
+        return textureLod(atlas,a,0.0);
+    }
+    return vec4(1,0,1,1);
+}
+#+end_src
+
+El color magenta señala una violación de la garantía de residencia. No debería aparecer en condiciones normales. El ejemplo no implementa los mips inferiores a la raíz, trilineal ni anisotropía. Es deliberadamente pequeño para poder comprobar la traducción de direcciones antes de añadir esas características.
+
+La tabla tiene su propia cadena mip de 128 por 128 hasta uno por uno. El sampler del atlas debe utilizar filtrado lineal dentro de un único nivel. No debemos generar automáticamente mips de todo el atlas: mezclarían celdas físicamente contiguas que no son necesariamente vecinas en el espacio virtual.
+
+* Cómo averiguar qué páginas cargar
+
+La CPU podría proyectar cada triángulo visible y calcular las regiones UV que necesita. Sin embargo, eso duplica parte del trabajo de rasterización y puede solicitar regiones ocultas. Una alternativa consiste en dejar que los propios shaders generen información de demanda.
+
+El mecanismo más sencillo es un bitset de páginas. Cada fragmento calcula la dirección deseada y activa un bit. Para 21845 páginas hacen falta 683 palabras de 32 bits, unos 2732 bytes. Una operación atomicOr evita perder solicitudes cuando varios fragmentos escriben simultáneamente en la misma palabra.
+
+#+begin_src glsl
+layout(std430,set=0,binding=2) buffer Requests {
+    uint words[];
+} requests;
+
+void requestPage(uint id) {
+    atomicOr(requests.words[id >> 5u],
+             1u << (id & 31u));
+}
+#+end_src
+
+La numeración global puede obtenerse sumando el número de páginas de los niveles anteriores. Para una textura cuadrada con K páginas por lado en el nivel cero, el desplazamiento del nivel m es la suma de K al cuadrado dividido por cuatro elevado a cada nivel anterior.
+
+El bitset es compacto, pero millones de fragmentos pueden competir por una misma palabra. Podemos emitir solicitudes desde una pasada de resolución reducida, combinar peticiones por subgrupo o generar un mapa de mip mínimo por región. La reducción de resolución debe tener en cuenta las derivadas: si la pasada utiliza una cuadrícula cuatro veces más gruesa, las derivadas reflejan esa cuadrícula, no la resolución final.
+
+Otra opción es generar una lista compacta mediante compute. Cada grupo lee palabras del bitset, enumera los bits activos y reserva espacio en una cola de salida. La CPU recibe solo las páginas necesarias, junto con información de prioridad si la hemos calculado. Hay que limitar la capacidad de la cola y registrar desbordamientos, en lugar de escribir fuera del buffer.
+
+** Feedback por hardware en Direct3D 12
+
+Sampler Feedback ofrece una vía más integrada para registrar demanda. La especificación de Microsoft distingue mapas de mip mínimo y mapas de regiones mip utilizadas. El formato físico del mapa es opaco y se necesita una operación de resolución para obtener información interpretable por la aplicación.
+
+El shader puede expresar una operación de feedback asociada a una textura y su sampler. Por ejemplo, el siguiente fragmento HLSL muestra el patrón conceptual para un mapa de mip mínimo:
+
+#+begin_src hlsl
+Texture2D<float4> terrain : register(t0);
+SamplerState linearSampler : register(s0);
+FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP>
+    feedback : register(u0);
+
+float4 shade(float2 uv) {
+    feedback.WriteSamplerFeedback(
+        terrain, linearSampler, uv);
+    return terrain.Sample(linearSampler, uv);
+}
+#+end_src
+
+El ejemplo requiere soporte de sampler feedback y un mapa correctamente asociado a la textura. En un motor de streaming real, la muestra de color debe estar limitada a niveles residentes, mientras que la solicitud de feedback debe conservar la demanda de detalle original. La aplicación consulta el tier mediante CheckFeatureSupport y configura el recurso de feedback de acuerdo con las restricciones del dispositivo.
+
+No es un mecanismo automático de carga desde disco. La aplicación sigue siendo responsable de interpretar el mapa, elegir páginas, reservar memoria y coordinar transferencias. Su ventaja es que puede registrar la demanda de una operación de muestreo sin reconstruir manualmente todos los detalles de su huella.
+
+* Recursos dispersos en Vulkan
+
+El atlas anterior funciona con imágenes ordinarias y permite controlar completamente la política de memoria. Otra estrategia es crear una imagen virtual cuyo almacenamiento físico se asigna por regiones. Vulkan denomina sparse resources a esta familia de mecanismos.
+
+Para una imagen 2D parcialmente residente se necesitan las capacidades sparseBinding y sparseResidencyImage2D, una cola con VK_QUEUE_SPARSE_BINDING_BIT y un formato compatible. La aplicación consulta las propiedades de formato disperso y los requisitos de memoria de la imagen. El tamaño de página no se elige arbitrariamente: depende de la granularidad que informa el dispositivo.
+
+La imagen se crea con VK_IMAGE_CREATE_SPARSE_BINDING_BIT y VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT. La asociación de regiones a memoria se realiza mediante vkQueueBindSparse, no mediante el comando normal de copia.
+
+#+begin_src cpp
+// Ejemplo parcial: memoria y granularidad ya consultadas.
+VkSparseImageMemoryBind tile{};
+tile.subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+tile.subresource.mipLevel = mip;
+tile.subresource.arrayLayer = 0;
+tile.offset = offset;
+tile.extent = extent;
+tile.memory = poolMemory;
+tile.memoryOffset = alignedOffset;
+
+VkSparseImageMemoryBindInfo imageBind{};
+imageBind.image = image;
+imageBind.bindCount = 1;
+imageBind.pBinds = &tile;
+
+VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+info.imageBindCount = 1;
+info.pImageBinds = &imageBind;
+info.signalSemaphoreCount = 1;
+info.pSignalSemaphores = &bindingReady;
+
+VkResult result = vkQueueBindSparse(
+    sparseQueue, 1, &info, VK_NULL_HANDLE);
+#+end_src
+
+El fragmento presupone que bindingReady es un semáforo binario disponible, que la región satisface la granularidad y que la memoria cumple los requisitos de tipo, tamaño y alineación. La cola de transferencia espera el semáforo antes de escribir la región. Una segunda dependencia permite que los shaders lean los datos después de finalizar la copia y las transiciones de layout necesarias.
+
+Los niveles pequeños pueden estar agrupados en una mip tail que requiere asociaciones opacas de memoria. No podemos tratarlos necesariamente como páginas independientes. También deben respetarse los requisitos de metadatos de la imagen cuando existan.
+
+La residencia dispersa no implica que una lectura de una región ausente recupere automáticamente su ancestro. El motor debe implementar esa política, por ejemplo mediante una tabla de niveles residentes o instrucciones de consulta de residencia cuando estén disponibles. Tampoco debe asumir que una lectura no residente devuelve un color útil: las garantías dependen de las propiedades del dispositivo.
+
+La ventaja frente al atlas es que la imagen mantiene su espacio de coordenadas natural y el hardware puede filtrar a través de páginas vecinas correctamente residentes. El inconveniente es que las asociaciones de memoria y su sincronización pueden tener costes significativos y dependientes del controlador. Conviene agrupar operaciones y medirlas en los dispositivos objetivo.
+
+* Diseñar el sistema de streaming
+
+Una página pasa por varias etapas: ausente, solicitada, en lectura, preparada para transferencia, cargada y finalmente visible para el shader. Es importante separar estas etapas. Una página cuya lectura de disco ha terminado todavía no es residente desde el punto de vista del renderizador.
+
+Consideremos tres fotogramas simultáneamente en vuelo. El fotograma A lee la tabla de páginas y utiliza la celda 17. Mientras tanto, la CPU decide expulsar esa página para introducir otra. Si sobrescribe la celda antes de que A termine, el shader puede leer datos pertenecientes a otro material aunque su tabla de páginas sea perfectamente válida.
+
+Por tanto, la vida útil de una celda debe incluir todos los lectores pendientes. Una solución consiste en asociar cada celda con el último valor de un timeline semaphore que podría utilizarla. Solo se recicla cuando la GPU ha alcanzado ese valor. Las tablas de páginas también necesitan versiones o una estrategia equivalente de sincronización.
+
+#+begin_src cpp
+enum class State {
+    Free, Loading, Uploading, Resident, Retired
+};
+
+struct Slot {
+    State state = State::Free;
+    uint64_t lastUse = 0;
+    uint64_t uploadDone = 0;
+    uint32_t generation = 0;
+};
+
+bool reusable(const Slot& s, uint64_t completed) {
+    return s.state == State::Free ||
+           (s.state == State::Retired &&
+            s.lastUse <= completed &&
+            s.uploadDone <= completed);
+}
+#+end_src
+
+El ejemplo supone que todos los valores pertenecen a una misma línea temporal ordenada. Si las colas de copia y gráficos usan semáforos independientes, hay que comparar cada valor con su contador correspondiente.
+
+La generación ayuda a descartar resultados de tareas asíncronas antiguas. Imaginemos una lectura que tarda demasiado, cuya petición se cancela y cuya celda se reasigna. Cuando llega el resultado original, debe comprobarse la generación antes de publicarlo. Esta comprobación no sustituye a la sincronización de GPU; resuelve otro problema, el de la identidad de las tareas.
+
+** Prioridad y estabilidad
+
+Una política LRU pura expulsa la página que lleva más tiempo sin utilizarse. Es razonable para un primer prototipo, pero no siempre para un mundo abierto. Una página gruesa puede servir como respaldo de cientos de páginas finas y tener un valor visual muy superior al de una página que solo se ha utilizado recientemente en una esquina de la pantalla.
+
+Podemos combinar antigüedad, cobertura de pantalla y diferencia entre el nivel solicitado y el disponible. Por ejemplo, una prioridad heurística es
+
+\[
+ Q=\frac{A(1+\Delta m)}{C+\epsilon},
+\]
+
+donde A es una estimación de píxeles afectados, delta m es la diferencia de nivel y C representa el coste de carga. No es una fórmula universal: su función es expresar explícitamente qué beneficio esperamos por unidad de coste.
+
+La predicción de movimiento también ayuda. Si la cámara avanza hacia una pared, solicitar anticipadamente las páginas cercanas reduce el retraso visible. Pero una predicción demasiado agresiva desplaza páginas útiles y aumenta el tráfico. Conviene reservar una fracción limitada del presupuesto a precarga especulativa.
+
+* Ancho de banda y latencia
+
+Con páginas BC7 de 18496 bytes y un presupuesto de 64 cargas por fotograma, transferimos aproximadamente 1,13 MiB por fotograma, o 67,7 MiB por segundo a 60 Hz. Es una cifra de datos útiles, no una medida del tráfico real: faltan alineaciones, metadatos, copias intermedias y otros canales de material.
+
+Si el feedback tarda dos fotogramas en llegar a la CPU y la lectura, preparación y transferencia necesitan otros dos, la textura fina aparece unos 67 milisegundos después de detectarse la demanda a 60 Hz. Durante ese intervalo el ancestro debe mantener una imagen coherente.
+
+La capacidad de la caché y el ancho de banda son problemas diferentes. Una caché enorme no ayuda a cargar instantáneamente una región completamente nueva; un almacenamiento rápido tampoco evita la expulsión continua cuando el conjunto de trabajo supera la memoria disponible.
+
+En ese segundo caso aparece thrashing: las páginas se expulsan y vuelven a solicitarse repetidamente. Una respuesta útil consiste en aumentar temporalmente el sesgo mip global. Al subir un nivel, el número de páginas necesarias para cubrir una misma superficie puede reducirse aproximadamente a una cuarta parte. La calidad baja de manera controlada, pero el sistema recupera estabilidad.
+
+El sesgo debe variar lentamente. Si se modifica cada fotograma en función de una sola medida, puede oscilar entre dos niveles y provocar una alternancia visible de nitidez. Una media móvil de la presión de memoria y umbrales distintos para aumentar y reducir el sesgo permiten introducir histéresis.
+
+* Laboratorio práctico
+
+Un primer experimento puede construirse con una textura procedural de 8192 por 8192, dividida en páginas de 128 texels. Generemos un patrón de cuadrícula con números que identifiquen cada página y colores diferentes por nivel mip. No hace falta almacenar una imagen enorme: cada página puede generarse independientemente a partir de coordenadas globales.
+
+Primero implementamos un atlas de 64 celdas, una tabla R32_UINT y una raíz fija. Dibujamos un plano y desplazamos la cámara. El objetivo inicial es comprobar que los límites de página no producen saltos y que las regiones ausentes muestran el ancestro correcto.
+
+Después añadimos feedback mediante bitset, una cola de solicitudes y un presupuesto de cuatro cargas por fotograma. Registramos la tasa de aciertos, el número de solicitudes únicas, las expulsiones, los bytes transferidos y el tiempo desde solicitud hasta publicación. Conviene distinguir la tasa de aciertos por página de la tasa ponderada por píxeles: una sola página muy visible puede dominar la calidad percibida.
+
+Finalmente comparamos tres políticas: LRU, prioridad por cobertura y prioridad con sesgo mip adaptativo. Repetimos un recorrido de cámara determinista, incluyendo una rotación brusca y un acercamiento lento. Las métricas deben recogerse después de un calentamiento y también durante los primeros fotogramas, porque el comportamiento en frío es una parte esencial del problema.
+
+Para medir el coste gráfico, utilizamos consultas de timestamps alrededor del pase de feedback, la compactación y el renderizado principal. Las consultas de GPU deben leerse de forma diferida para no introducir una espera que falsee el resultado. El tiempo de disco y la preparación de páginas se miden por separado en CPU.
+
+Una ampliación interesante consiste en reemplazar el atlas por una imagen dispersa Vulkan conservando la misma política de solicitudes. Así podemos comparar dos implementaciones de residencia sin cambiar simultáneamente el algoritmo de streaming.
+
+* Cuándo no merece la pena
+
+Las texturas virtuales añaden una capa de indirección, metadatos, tareas asíncronas y complejidad de sincronización. Si un juego utiliza materiales pequeños repetidos y todos caben cómodamente en memoria, el mip streaming tradicional puede ser más sencillo y rápido. Tampoco debe confundirse la virtualización con la compresión: ambas técnicas son complementarias, pero resuelven problemas diferentes.
+
+Un atlas manual ofrece portabilidad y control, a costa de bordes, instrucciones adicionales y filtrado más difícil. Los recursos dispersos conservan mejor el modelo de textura convencional, pero dependen de capacidades y costes específicos del hardware. Sampler Feedback mejora la observación de demanda, pero no sustituye a ninguna de las dos estrategias de almacenamiento.
+
+La idea fundamental es que el motor no necesita mantener todos los detalles de un mundo en memoria al mismo tiempo. Necesita mantener una aproximación válida de todo el mundo y una selección suficientemente buena de detalles allí donde el usuario los observa. Esta distinción convierte el problema de tamaño de textura en un problema de planificación de recursos en tiempo real.
+
+* Referencias primarias
+
+- [[https://docs.vulkan.org/spec/latest/chapters/sparsemem.html][Khronos, Vulkan Specification: Sparse Resources]]. Especificación normativa de asociaciones dispersas, granularidad, residencia y mip tails.
+- [[https://microsoft.github.io/DirectX-Specs/d3d/SamplerFeedback.html][Microsoft, DirectX Sampler Feedback Specification]]. Describe formatos opacos, operaciones de feedback, niveles de soporte y streaming.
+- [[https://learn.microsoft.com/en-us/windows/win32/direct3d11/why-are-tiled-resources-needed-][Microsoft, Why are tiled resources needed?]]. Contexto de la introducción de recursos por teselas en Direct3D.
+- [[https://learn.microsoft.com/en-us/windows/win32/direct3d11/creating-tiled-resources][Microsoft, Creating tiled resources]]. Separación de espacio lógico y almacenamiento físico.
+
+Los ejemplos y presupuestos numéricos de este capítulo son derivaciones didácticas propias, no resultados de benchmarks publicados. Las referencias son documentación primaria de APIs consolidadas.
