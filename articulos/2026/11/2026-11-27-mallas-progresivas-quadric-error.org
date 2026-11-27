@@ -1,0 +1,398 @@
+#+TITLE: Mallas progresivas y error cuádrico: cómo eliminar triángulos sin destruir una superficie
+#+DATE: 2026-11-27
+#+LANGUAGE: es
+#+FILETAGS: :historia:retro:geometria:lod:cpp:
+
+* El problema que precedió a las GPU programables
+
+En la segunda mitad de los noventa, digitalizar una escultura o construir un terreno detallado podía producir cientos de miles de triángulos. La capacidad de dibujarlos interactivamente no crecía al mismo ritmo que la capacidad de generarlos. Incluso cuando la rasterización estaba acelerada, transformar vértices, enviar índices y organizar las llamadas de dibujo seguía teniendo un coste. Y un objeto lejano podía ocupar apenas veinte píxeles aunque su modelo contuviera miles de caras.
+
+La solución más intuitiva era crear varias versiones del mismo modelo. Un artista preparaba una representación detallada para primeros planos, otra para distancias medias y una tercera para el fondo. El motor elegía una de ellas. Este mecanismo, denominado nivel de detalle o LOD, es sencillo de ejecutar, pero desplaza un problema difícil a la producción de contenidos: ¿cómo construir automáticamente una buena aproximación?
+
+No basta con borrar triángulos alternos. Eso deja agujeros. Tampoco basta con eliminar los triángulos más pequeños: una hilera de caras diminutas puede definir el borde de una puerta, mientras que cientos de triángulos grandes y coplanares pueden ser redundantes. La simplificación tiene que modificar simultáneamente geometría y conectividad.
+
+Dos publicaciones de SIGGRAPH marcaron este campo. Hugues Hoppe presentó Progressive Meshes en 1996, una representación que recupera detalle mediante operaciones inversas de simplificación. Michael Garland y Paul Heckbert presentaron en 1997 una métrica compacta para evaluar contracciones de vértices, conocida como QEM. Son contribuciones diferentes y complementarias: una define cómo representar una secuencia de resoluciones; la otra proporciona un criterio geométrico para construir aproximaciones.
+
+Hoy vamos a derivar ese criterio, construir el núcleo de un simplificador y estudiar cómo utilizar su resultado en un motor. El objetivo no es reproducir exactamente QSlim ni el algoritmo de optimización original de Hoppe, sino entender las decisiones que siguen presentes en las herramientas de geometría actuales.
+
+* Qué significa contraer una arista
+
+Consideremos una malla triangular indexada. Cada cara contiene tres identificadores de vértices. Una arista interior de una superficie manifold cerrada pertenece a dos caras. Si sus extremos son u y v, podemos sustituirlos por un único vértice x, eliminar las dos caras que pasan a tener índices repetidos y actualizar las caras restantes.
+
+La operación suele reducir el número de vértices en uno y el de caras en dos. En un borde abierto puede desaparecer una sola cara. Estas cifras no son universales: una contracción inválida puede producir caras duplicadas, componentes desconectados o aristas con más de dos caras incidentes.
+
+Hay dos preguntas independientes. Primero, ¿qué arista conviene contraer? Segundo, ¿dónde debe situarse el vértice resultante? Elegir siempre el punto medio parece razonable, pero puede redondear una esquina que debería conservarse. Elegir siempre el extremo más cercano a la cámara introduce una dependencia de vista durante la preparación del modelo que no queremos en un LOD reutilizable.
+
+Una métrica útil debe distinguir desplazamientos tangenciales de desplazamientos normales. En una superficie plana podemos mover un vértice dentro del plano sin alterar la superficie local, siempre que mantengamos el contorno. En una esquina, en cambio, existen varios planos que imponen restricciones simultáneas. Esta observación es la base de QEM.
+
+* De la distancia a un plano a una matriz
+
+** Distancia con signo
+
+Sea un plano de ecuación
+
+\[
+ax+by+cz+d=0,
+\qquad a^2+b^2+c^2=1.
+\]
+
+La normal unitaria es n=(a,b,c). Para un punto r, la distancia con signo al plano es el producto escalar n con r más d. La normalización es indispensable: multiplicar todos los coeficientes por diez describe el mismo plano, pero multiplicaría por cien el error cuadrático si no normalizáramos.
+
+Para un triángulo con posiciones A, B y C, obtenemos la normal mediante el producto vectorial de B-A y C-A, dividido por su longitud. El término d es el negativo del producto escalar de la normal con A. Si el producto vectorial es prácticamente nulo, la cara es degenerada y no debemos dividir por él.
+
+Usamos coordenadas homogéneas, aunque aquí no estamos proyectando geometría:
+
+\[
+p=(a,b,c,d)^T,\qquad
+\bar r=(x,y,z,1)^T.
+\]
+
+El cuadrado de la distancia es
+
+\[
+(p^T\bar r)^2=\bar r^T(pp^T)\bar r.
+\]
+
+La matriz exterior K=pp^T tiene dimensión cuatro por cuatro, es simétrica y semidefinida positiva. Sus dieciséis entradas contienen solamente diez valores independientes. Esta identidad convierte una colección de restricciones geométricas en una estructura de tamaño constante.
+
+** Acumulación de restricciones
+
+Asignamos inicialmente a cada vértice la suma de las matrices de sus caras incidentes. Si contraemos dos vértices, sumamos sus matrices:
+
+\[
+Q_x=Q_u+Q_v,\qquad E(r)=\bar r^TQ_x\bar r.
+\]
+
+No necesitamos conservar explícitamente todos los planos originales. La suma representa la suma de sus errores cuadrados, incluyendo las multiplicidades heredadas de la construcción. No es una distancia exacta a la superficie ni una integral exacta sobre su área. Es un sustituto local barato de evaluar.
+
+La acumulación es importante: si recalculásemos exclusivamente los planos de la malla simplificada después de cada operación, olvidaríamos parte de la geometría que ya hemos eliminado. Una secuencia de pequeñas modificaciones podría terminar desplazando la superficie considerablemente sin que la métrica local recordase su forma inicial.
+
+Se pueden introducir pesos positivos, por ejemplo relacionados con el área de las caras, pero eso cambia la métrica y su escala. Una cara grande tendría mayor influencia; una zona densamente triangulada dejaría de dominar simplemente por contener muchas caras. En el laboratorio conviene comenzar con pesos unitarios y comparar después.
+
+* Encontrar la posición óptima
+
+Descomponemos Q en una matriz A de tres por tres, un vector b y un escalar c:
+
+\[
+E(r)=r^TAr+2b^Tr+c.
+\]
+
+Como A es simétrica, el gradiente es
+
+\[
+\nabla E=2Ar+2b.
+\]
+
+Si A es invertible, el mínimo se obtiene resolviendo
+
+\[
+Ar=-b.
+\]
+
+No hace falta calcular la inversa explícitamente. Un sistema lineal de tres incógnitas se puede resolver mediante eliminación gaussiana con pivoteo, o mediante una descomposición apropiada. La matriz puede ser singular o estar mal condicionada, por ejemplo cuando todos los planos son paralelos. Eso no es un error de la geometría: significa que algunas direcciones están poco restringidas.
+
+Imaginemos tres planos ortogonales x=0, y=0 y z=0. Su error conjunto es x al cuadrado más y al cuadrado más z al cuadrado. El mínimo está en el origen. Si solo tenemos el plano z=0, cualquier posición con z=0 es óptima. En una arista definida por x=0 e y=0, el eje z entero tiene error nulo. La métrica distingue así zonas planas, crestas y esquinas sin necesitar una clasificación explícita.
+
+Una alternativa robusta es minimizar sobre el segmento de la arista. Escribimos r(t)=u+t(v-u), con t entre cero y uno. Si s=v-u, obtenemos
+
+\[
+E(t)=E(u)+2t\,s^T(Au+b)+t^2s^TAs.
+\]
+
+Derivando respecto de t, el mínimo no restringido es
+
+\[
+t_*=-\frac{s^T(Au+b)}{s^TAs}.
+\]
+
+Lo limitamos al intervalo de la arista. Si el denominador es prácticamente cero, comparamos los extremos y el punto medio. El segmento es una restricción adicional: puede dar un error mayor que el mínimo libre, pero evita algunos desplazamientos exagerados.
+
+Por ejemplo, con los planos x=0 e y=0, tomemos u=(0,2,0) y v=(2,0,0). El error sobre el segmento es 4t al cuadrado más 4(1-t) al cuadrado. El mínimo está en t=0.5 y vale 2. El mínimo libre, el origen, vale cero, pero no pertenece al segmento. La elección depende de si preferimos preservar las posiciones locales o permitir una optimización más agresiva.
+
+* Núcleo de implementación C++20
+
+El siguiente fragmento utiliza una matriz completa para hacer explícitas las operaciones. En una herramienta real podemos almacenar únicamente el triángulo superior. Los cálculos se realizan en doble precisión y se presupone que las coordenadas del modelo se han normalizado a una escala razonable.
+
+#+begin_src cpp
+#include <array>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+using V = std::array<double, 3>;
+using H = std::array<double, 4>;
+
+struct Quadric {
+    double q[4][4]{};
+
+    void addPlane(H p, double weight = 1.0) {
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j)
+                q[i][j] += weight*p[i]*p[j];
+    }
+
+    Quadric operator+(const Quadric& b) const {
+        Quadric r;
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j)
+                r.q[i][j] = q[i][j]+b.q[i][j];
+        return r;
+    }
+
+    double error(V v) const {
+        H p{v[0], v[1], v[2], 1.0};
+        double e = 0;
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j)
+                e += p[i]*q[i][j]*p[j];
+        return std::max(0.0, e);
+    }
+};
+#+end_src
+
+La saturación a cero elimina pequeños valores negativos producidos por cancelación numérica; no debe ocultar matrices inválidas. En una compilación de depuración conviene verificar que las entradas son finitas y que el error negativo no supera una tolerancia relativa.
+
+Para calcular el óptimo restringido, evaluamos los dos productos matriciales derivados anteriormente.
+
+#+begin_src cpp
+V segmentMinimum(const Quadric& q, V u, V v) {
+    V s{}, g{};
+    for (int i = 0; i < 3; ++i)
+        s[i] = v[i]-u[i];
+
+    double numerator = 0, denominator = 0;
+    for (int i = 0; i < 3; ++i) {
+        g[i] = q.q[i][3];
+        double as = 0;
+        for (int j = 0; j < 3; ++j) {
+            g[i] += q.q[i][j]*u[j];
+            as += q.q[i][j]*s[j];
+        }
+        numerator += s[i]*g[i];
+        denominator += s[i]*as;
+    }
+
+    V best = u;
+    auto test = [&](V x) {
+        if (q.error(x) < q.error(best)) best = x;
+    };
+    test(v);
+    V mid{};
+    for (int i = 0; i < 3; ++i)
+        mid[i] = (u[i]+v[i])*0.5;
+    test(mid);
+
+    if (denominator > 1e-14) {
+        double t = std::clamp(
+            -numerator/denominator, 0.0, 1.0);
+        V x{};
+        for (int i = 0; i < 3; ++i)
+            x[i] = u[i]+t*s[i];
+        test(x);
+    }
+    return best;
+}
+#+end_src
+
+Este código es el núcleo numérico, no un simplificador completo. La tolerancia absoluta presupone una escala normalizada; con pesos muy diferentes conviene utilizar una tolerancia relativa a la magnitud de A y del segmento. Podemos añadir el mínimo libre como candidato, siempre que pase las comprobaciones topológicas y geométricas.
+
+* La estructura de datos importa tanto como las matemáticas
+
+Una lista plana de triángulos es excelente para enviar datos a una GPU, pero incómoda para modificar la conectividad. Para contraer una arista necesitamos conocer rápidamente las caras incidentes a ambos extremos y los vecinos de cada vértice.
+
+Una estructura half-edge representa cada arista orientada con referencias a su origen, su siguiente arista dentro de la cara, su opuesta y la cara correspondiente. Permite recorrer el entorno de un vértice sin buscar por toda la malla. Otra opción, más fácil para un primer prototipo, es conservar arrays de vértices y caras con identificadores estables y listas de incidencia por vértice.
+
+No debemos borrar elementos de un vector desplazando todos los posteriores durante cada contracción. Es preferible marcar los elementos eliminados y compactar al terminar. De lo contrario, cada operación puede invalidar miles de referencias y convertir un algoritmo local en uno global.
+
+** La cola de prioridad
+
+Inicialmente calculamos el coste de todas las aristas y las insertamos en un montículo mínimo. Extraemos la más barata, comprobamos que sigue existiendo, validamos la contracción, actualizamos las caras afectadas y sumamos las matrices. Después recalculamos los candidatos de la región modificada.
+
+Actualizar directamente entradas arbitrarias de un montículo exige mantener referencias adicionales. Una alternativa es insertar nuevas entradas y descartar las antiguas al extraerlas. Cada vértice conserva una generación que cambia cuando se modifica su geometría, conectividad o restricciones relevantes.
+
+#+begin_src cpp
+#include <cstdint>
+#include <queue>
+#include <vector>
+
+struct Candidate {
+    double cost;
+    uint32_t u, v;
+    uint64_t genU, genV;
+    V position;
+};
+
+struct GreaterCost {
+    bool operator()(const Candidate& a,
+                    const Candidate& b) const {
+        return a.cost > b.cost;
+    }
+};
+
+using Heap = std::priority_queue<
+    Candidate, std::vector<Candidate>, GreaterCost>;
+#+end_src
+
+Al extraer una entrada comparamos ambas generaciones con las actuales. Si no coinciden, descartamos la entrada. Tras una contracción debemos invalidar también candidatos cuyos tests de validez dependan del vecindario modificado, no solo los que compartan el vértice superviviente. Una implementación puede reconstruir periódicamente el montículo si acumula demasiadas entradas obsoletas.
+
+El algoritmo de alto nivel es el siguiente. Las funciones representan operaciones sobre la estructura de conectividad elegida, no una API estándar de C++.
+
+#+begin_src cpp
+while (mesh.faceCount() > target && !heap.empty()) {
+    Candidate c = heap.top();
+    heap.pop();
+    if (!mesh.isCurrent(c)) continue;
+    if (!mesh.canCollapse(c)) continue;
+
+    auto affected = mesh.collapse(c.u, c.v,
+                                  c.position);
+    mesh.invalidateNeighborhood(affected);
+    mesh.enqueueNeighborhood(affected, heap);
+}
+#+end_src
+
+El coste inicial depende del número de aristas y de cómo construyamos el montículo. Cada extracción e inserción cuesta logaritmo del tamaño del montículo. En una malla con grado local acotado, el trabajo de actualización por contracción suele ser pequeño. No existe, sin embargo, una garantía universal de complejidad basada únicamente en el número de caras: vértices de grado muy alto, candidatos rechazados y entradas obsoletas pueden dominar el tiempo.
+
+* Evitar que una buena puntuación produzca una mala malla
+
+La métrica no sabe qué es una superficie válida. Dos vértices de lados opuestos de una lámina fina pueden estar muy cerca y tener planos casi coincidentes. Unirlos podría destruir el objeto. Garland y Heckbert contemplaban incluso la agregación de regiones desconectadas; aquí restringimos deliberadamente el algoritmo a aristas existentes y a una política de preservación topológica.
+
+Para una malla triangular manifold, la condición de enlace compara el enlace de los dos vértices con el enlace de su arista. En el caso interior ordinario, los vecinos comunes deben corresponder exactamente a los dos vértices opuestos de las caras incidentes. No basta con contar vecinos comunes en todos los casos: hay que comprobar también los simplices compartidos, los bordes y las configuraciones especiales, como un tetraedro. La igualdad de enlaces es una condición topológica más precisa que una simple comparación de cardinalidades.
+
+Después comprobamos las caras que sobrevivirán. Calculamos sus normales antes y después de la operación. Rechazamos una contracción que invierta la orientación, reduzca el área por debajo de un umbral o deforme excesivamente una cara. Un producto escalar positivo entre normales evita inversiones locales de más de noventa grados, pero no garantiza ausencia de intersecciones con caras lejanas. Para eso haría falta una prueba adicional, por ejemplo con una jerarquía espacial.
+
+En los bordes abiertos podemos bloquear sus vértices o añadir planos de penalización perpendiculares a la superficie y que contengan la arista de borde. Su distancia penaliza el movimiento transversal al contorno. La segunda estrategia permite simplificar una frontera larga sin perder completamente su forma. Un peso demasiado grande puede impedir cualquier reducción razonable cerca de la frontera.
+
+** La geometría no es toda la apariencia
+
+En un modelo de videojuego hay normales, coordenadas UV, colores, materiales y, posiblemente, pesos de animación. Una costura UV puede contener dos vértices de renderizado con idéntica posición pero distintas coordenadas. Si los tratamos como una única entidad sin conservar esa discontinuidad, la textura puede atravesar regiones incorrectas.
+
+Una solución conservadora consiste en separar conectividad geométrica y atributos por esquina de triángulo. Podemos bloquear contracciones que mezclen materiales incompatibles y conservar las costuras de textura. Otra opción es ampliar la métrica para incorporar atributos, como investigaron Garland y Heckbert en 1998. La escala relativa de esos atributos es una decisión importante: un metro de desplazamiento no tiene una equivalencia universal con una unidad de UV.
+
+También debemos distinguir una normal geométrica de una normal de sombreado. Recalcular todas las normales por promedio puede suavizar una arista que el artista había marcado como dura. En personajes animados, una simplificación aceptable en pose de reposo puede deformar mal el codo al doblarlo. El error debería evaluarse también en poses representativas cuando la animación sea importante.
+
+* Mallas progresivas: invertir la simplificación
+
+Supongamos que comenzamos con 50.000 triángulos y realizamos una secuencia de contracciones hasta obtener una malla base de 500. En lugar de guardar solamente la última versión, registramos suficiente información para invertir cada operación. Al recorrer esos registros en orden inverso recuperamos resoluciones intermedias.
+
+En la representación de Hoppe, la operación inversa fundamental es el vertex split. El registro identifica el vértice que se divide, cómo se redistribuye su entorno y los datos necesarios para restaurar las posiciones y atributos. Una implementación didáctica puede guardar las caras modificadas y eliminadas completas, aunque eso es menos compacto que una codificación especializada.
+
+La propiedad interesante es que cada prefijo válido de la secuencia de refinamiento define una malla utilizable. Podemos transmitir primero la base y mostrar una aproximación mientras llegan los registros restantes. También podemos elegir una resolución intermedia sin almacenar una copia completa por cada número posible de triángulos.
+
+Para evitar el salto visual entre dos resoluciones, podemos realizar un geomorph. Tras restaurar la conectividad de un split, inicializamos los vértices separados en la posición del vértice grueso y los desplazamos gradualmente hacia sus posiciones detalladas:
+
+\[
+r(\alpha)=(1-\alpha)r_0+\alpha r_1,
+\qquad 0\leq\alpha\leq1.
+\]
+
+En el instante inicial algunas caras tienen área cero; al avanzar la transición recuperan su tamaño. Hay que cuidar las normales y los atributos durante el proceso. Para combinar varios splits, las correspondencias y las dependencias deben mantenerse coherentes. No podemos aplicar operaciones arbitrarias fuera de orden sin una estructura que describa qué refinamientos requieren otros anteriores.
+
+El refinamiento dependiente de vista añade precisamente esa dificultad. Una parte del objeto puede necesitar más detalle que otra. Una jerarquía de dependencias permite seleccionar refinamientos locales, pero requiere resolver compatibilidad entre regiones para evitar grietas y conectividad inconsistente. Para un motor pequeño, generar varios LOD discretos offline suele ser un primer paso mucho más práctico.
+
+* Del error geométrico al error en pantalla
+
+Un presupuesto fijo de triángulos no tiene en cuenta la distancia, el campo de visión ni la resolución. Una desviación de un centímetro puede ser invisible en un objeto lejano y evidente en primer plano.
+
+Para una cámara perspectiva con altura H en píxeles y campo de visión vertical theta, la distancia focal en píxeles es
+
+\[
+f_y=\frac{H}{2\tan(\theta/2)}.
+\]
+
+Una coordenada vertical de cámara y, a profundidad positiva z, se proyecta aproximadamente como f_y y/z respecto al centro de pantalla. Una perturbación vertical delta y a profundidad constante produce
+
+\[
+\Delta y_{\rm px}=\frac{f_y}{z}\Delta y.
+\]
+
+Para una pantalla de 1080 píxeles de altura y un campo de visión vertical de 60 grados, f_y vale aproximadamente 935.3 píxeles. Un error transversal de 0.02 metros a diez metros de distancia representa 1.87 píxeles; a cuarenta metros representa 0.47 píxeles.
+
+La fórmula es una aproximación para desplazamientos transversales. Si cambia también la profundidad, la derivada de la proyección contiene un término adicional proporcional a y/z al cuadrado. Cerca de la cámara o lejos del centro de pantalla, una cota conservadora necesita considerar ese término y la profundidad mínima del objeto.
+
+No debemos introducir directamente la raíz del coste QEM en esta fórmula como si fuera una cota geométrica garantizada. QEM acumula distancias a planos con multiplicidades y pesos; no mide la máxima desviación de la superficie. Para seleccionar LOD por píxeles conviene medir una desviación geométrica separada, mediante muestras de superficie y consultas de distancia, o utilizar una cota certificada si el motor la necesita.
+
+Una estimación por muestreo en ambas direcciones detecta tanto zonas eliminadas del original como partes de la aproximación alejadas de él. No es una distancia de Hausdorff exacta: puede omitir regiones pequeñas si las muestras son insuficientes. Para un prototipo es una buena herramienta de comparación siempre que documentemos su naturaleza.
+
+* Integración en un renderizador OpenGL
+
+En un motor clásico podemos preparar tres o cuatro mallas estáticas durante la importación. Cada una tiene sus propios índices y, si las posiciones óptimas han cambiado, también sus propios vértices. Al dibujar elegimos la versión más barata cuyo error proyectado se mantiene dentro del presupuesto.
+
+#+begin_src cpp
+struct Lod {
+    unsigned vao;
+    int indexCount;
+    double errorMeters;
+};
+
+int chooseLod(const std::vector<Lod>& lods,
+              double focalPixels, double nearDepth,
+              double maxPixels) {
+    if (nearDepth <= 0.0) return 0;
+    int chosen = 0;
+    for (int i = 1; i < int(lods.size()); ++i) {
+        double e = lods[i].errorMeters
+                 * focalPixels / nearDepth;
+        if (e <= maxPixels) chosen = i;
+    }
+    return chosen;
+}
+#+end_src
+
+Se presupone que los niveles están ordenados de mayor a menor detalle, que sus errores están expresados en unidades del mundo y que la profundidad mínima se calcula de forma conservadora. Con escalado no uniforme debemos transformar también la estimación del error, por ejemplo multiplicándola por una cota de la máxima amplificación de la transformación.
+
+El dibujo en OpenGL moderno puede ser tan simple como:
+
+#+begin_src cpp
+const Lod& lod = lods[selected];
+glBindVertexArray(lod.vao);
+glDrawElements(GL_TRIANGLES, lod.indexCount,
+               GL_UNSIGNED_INT, nullptr);
+#+end_src
+
+Cada VAO debe tener asociados sus atributos y su buffer de índices. En OpenGL de finales de los noventa se podía realizar la misma selección con arrays de vértices y glDrawElements, sin VAO; los VBO llegaron posteriormente. La decisión de LOD no depende de la generación de la API.
+
+Para evitar oscilaciones cuando un objeto está cerca del umbral, introducimos histéresis. Por ejemplo, cambiamos a un nivel grueso cuando su error baja de 0.8 píxeles y volvemos al detallado cuando supera 1.2. Entre ambos límites mantenemos el estado anterior. Esto reduce cambios repetidos provocados por movimientos pequeños de cámara.
+
+En Vulkan podemos almacenar los niveles en buffers compartidos y seleccionar rangos de índices y desplazamientos de vértices mediante vkCmdDrawIndexed. En un sistema GPU-driven, la elección puede trasladarse a un compute shader que escribe comandos indirectos. La simplificación offline sigue siendo útil aunque cambie el mecanismo de envío.
+
+* Presupuesto de memoria y rendimiento
+
+Consideremos un modelo hipotético de 100.000 triángulos y 50.000 vértices, con 32 bytes por vértice e índices de 32 bits. Los vértices ocupan 1.600.000 bytes y los índices 1.200.000: en total, 2.8 MB decimales. Si generamos niveles con aproximadamente la mitad y la cuarta parte de los vértices y caras, las tres versiones ocupan 4.9 MB.
+
+Es un incremento del 75 por ciento respecto a almacenar solo el original. A cambio, dibujar la versión de un cuarto de tamaño reduce el número de índices enviados de 300.000 a 75.000. La reducción de trabajo de vértices dependerá también de la caché de transformación y del orden de índices. El número de fragmentos puede permanecer casi idéntico si el objeto sigue cubriendo la misma superficie en pantalla.
+
+La representación progresiva evita algunas duplicaciones de geometría, pero necesita registros de refinamiento y una estructura mutable. No debemos suponer que será siempre más pequeña que los LOD discretos comprimidos. El formato de almacenamiento, la cuantización, la redundancia de atributos y la frecuencia de reconstrucción cambian el resultado.
+
+QEM también tiene un coste de preparación. Diez valores double por vértice ocupan 80 bytes; para un millón de vértices son aproximadamente 76.3 MiB, antes de incluir posiciones, conectividad y montículo. Una matriz completa de dieciséis valores ocuparía aproximadamente 122 MiB. Esta diferencia explica por qué la representación simétrica compacta es importante incluso cuando el cálculo se realiza offline.
+
+* Laboratorio: construir y medir un simplificador
+
+Empezaría con una cuadrícula plana triangulada y una esfera generada proceduralmente. La cuadrícula comprueba que las contracciones interiores pueden tener coste cero y que los bordes no desaparecen. La esfera comprueba que las zonas curvas acumulan error y que el resultado no se convierte prematuramente en una colección de triángulos muy deformados.
+
+Añadiría después un cubo subdividido, una lámina fina y una malla con costuras UV. El cubo permite comprobar la conservación de esquinas; la lámina revela fusiones indeseadas y la malla texturizada muestra problemas que una visualización monocroma no detecta.
+
+Generaría niveles al 75, 50, 25 y 10 por ciento de las caras originales. Para cada uno registraría tiempo de simplificación, memoria máxima, número de contracciones rechazadas, error QEM acumulado, desviación de superficie estimada y distribución de áreas de triángulos. Compararía la imagen con una referencia desde varias cámaras, utilizando idéntica iluminación.
+
+Una comparación útil consiste en ejecutar el mismo algoritmo de conectividad con tres criterios: longitud de arista, QEM restringido al segmento y QEM con mínimo libre. Así aislamos el efecto de la métrica en lugar de comparar tres programas que también difieren en sus estructuras de datos.
+
+Finalmente dibujaría cientos de instancias y mediría por separado el tiempo de CPU, el tiempo de GPU y las invocaciones de vértices cuando la API y el hardware permitan obtenerlas. Las consultas de tiempo GPU deben recogerse de forma diferida para no introducir una espera artificial en cada fotograma. Repetiría la prueba con un shader de fragmentos barato y otro costoso. Si el segundo domina el tiempo total, reducir triángulos puede aportar poco beneficio.
+
+Estas son pruebas propuestas, no resultados medidos. Los ejemplos numéricos anteriores son cálculos teóricos.
+
+* Conclusiones
+
+La simplificación geométrica es una optimización de representación, no simplemente una reducción del contador de polígonos. QEM funciona porque convierte las restricciones de planos en una suma de matrices pequeñas y permite comparar numerosas contracciones con un coste local. Las mallas progresivas añaden una manera de conservar y recuperar el detalle perdido.
+
+La principal lección para un motor actual es separar tres problemas: construir aproximaciones geométricas, medir su error visible y seleccionar o transmitir el nivel adecuado. Una buena solución para el primero no resuelve automáticamente los otros dos. Tampoco sustituye la conservación de atributos, la validación topológica ni las mediciones de rendimiento.
+
+Estas ideas de 1996 y 1997 siguen siendo útiles porque permiten reducir trabajo antes de que la GPU tenga que ejecutarlo. La arquitectura moderna puede seleccionar miles de niveles en paralelo, pero la calidad de las aproximaciones continúa dependiendo de decisiones geométricas tomadas durante la preparación del contenido.
+
+* Referencias originales
+
+- Hugues Hoppe, Progressive Meshes, SIGGRAPH 1996, pp. 99-108. [[https://hhoppe.com/proj/pm/][Página del autor, artículo y material original]].
+- Michael Garland y Paul S. Heckbert, Surface Simplification Using Quadric Error Metrics, SIGGRAPH 1997. [[https://mgarland.org/archive/cmu/Papers/quadrics.pdf][Artículo original]].
+- Michael Garland y Paul S. Heckbert, Simplifying Surfaces with Color and Texture using Quadric Error Metrics, IEEE Visualization 1998. [[https://mgarland.org/research/quadrics.html][Publicaciones y recursos del autor]].
+- Michael Garland, Quadric-Based Polygonal Surface Simplification, tesis doctoral, Carnegie Mellon, 1999. [[https://mgarland.org/research/thesis.html][Tesis original]].
+- Michael Garland, QSlim 1.0, implementación histórica en C++. [[https://mgarland.org/software/qslim10.html][Distribución y documentación original]].
+
+Los fragmentos de código del capítulo son ejemplos didácticos originales; no se han copiado del código de QSlim.
